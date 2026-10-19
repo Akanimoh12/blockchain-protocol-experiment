@@ -9,8 +9,13 @@ use crate::constants::{
     MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
 };
 
-/// An externally owned account: Ethereum's account record, minus everything a
-/// contract would need.
+/// Ethereum's four-field account record.
+///
+/// `code_hash` and `storage_root` are *commitments*: the code and storage they
+/// commit to live in [`WorldState`], not here, because this struct is what gets
+/// RLP-encoded into the state root. For an account with no code or no storage
+/// both are `B256::ZERO` — Breeja's convention, where Ethereum would use
+/// `keccak256("")` and the empty-trie root. The EVM boundary translates.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, RlpEncodable)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -18,6 +23,23 @@ pub struct Account {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
+}
+
+/// Everything an EVM can read or write: accounts, the code they run, and their
+/// storage.
+///
+/// Code is keyed by its hash rather than by address, so a thousand copies of the
+/// same contract are stored once. That is what real nodes do, and it is the
+/// lookup REVM's `code_by_hash` expects to exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorldState {
+    pub accounts: HashMap<Address, Account>,
+    /// Runtime bytecode by `keccak256(code)`.
+    pub code: HashMap<B256, Bytes>,
+    /// Storage slots per account. A slot holding zero is *absent*, never stored
+    /// as zero, so two states with the same contents always compare and hash
+    /// equal.
+    pub storage: HashMap<Address, HashMap<U256, U256>>,
 }
 
 /// A sealed block.
@@ -143,15 +165,17 @@ pub struct BreejaGenesis {
 /// waiting to be mined.
 #[derive(Debug, Clone, Default)]
 pub struct BlockState {
-    /// Account state as of the chain head.
-    accounts: HashMap<Address, Account>,
+    /// Accounts, code and storage as of the chain head.
+    world: WorldState,
     /// Blocks by number; `blocks[n]` is the block with `number == n`.
     blocks: Vec<Block>,
-    /// Account state as it was *after* each block, so historical balance and
-    /// nonce queries can be answered honestly. A real node would reconstruct
-    /// this from a trie; Breeja keeps whole snapshots, which is only affordable
-    /// because a teaching chain has a handful of accounts.
-    state_history: Vec<HashMap<Address, Account>>,
+    /// World state as it was *after* each block, so historical balance, nonce,
+    /// code and storage queries can be answered honestly. A real node would
+    /// reconstruct this from a trie; Breeja keeps whole snapshots, which is only
+    /// affordable because a teaching chain has a handful of accounts. Once
+    /// contracts hold storage, every block copies every slot — see
+    /// `EVM-NOTES.md`, Part 0 question 4.
+    state_history: Vec<WorldState>,
     /// Block number for a given block hash.
     block_index: HashMap<B256, u64>,
     transactions: HashMap<B256, Transaction>,
@@ -201,6 +225,119 @@ impl Account {
             None => anyhow::bail!("balance overflow crediting {}", amount),
         }
     }
+}
+
+impl WorldState {
+    /// Builds a world of plain accounts with no code and no storage, which is
+    /// what genesis produces.
+    pub fn from_accounts(accounts: HashMap<Address, Account>) -> Self {
+        Self {
+            accounts,
+            ..Default::default()
+        }
+    }
+
+    /// The account at `address`, empty if nobody has ever touched it.
+    pub fn account(&self, address: &Address) -> Account {
+        self.accounts.get(address).cloned().unwrap_or_default()
+    }
+
+    /// Mutable access to an account, creating it empty if it does not exist.
+    pub fn account_mut(&mut self, address: Address) -> &mut Account {
+        self.accounts.entry(address).or_default()
+    }
+
+    /// The runtime code at `address`, empty for an account with no code.
+    pub fn code_of(&self, address: &Address) -> Bytes {
+        self.accounts
+            .get(address)
+            .filter(|account| account.code_hash != B256::ZERO)
+            .and_then(|account| self.code.get(&account.code_hash))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// One storage slot of `address`. An unwritten slot reads as zero, as in the
+    /// EVM.
+    pub fn storage_at(&self, address: &Address, slot: U256) -> U256 {
+        self.storage
+            .get(address)
+            .and_then(|slots| slots.get(&slot))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Installs runtime code at `address` and points its `code_hash` at it.
+    ///
+    /// Empty code means "no code", which Breeja records as a zero hash.
+    pub fn set_code(&mut self, address: Address, code: Bytes) {
+        if code.is_empty() {
+            self.account_mut(address).code_hash = B256::ZERO;
+            return;
+        }
+        let hash = keccak256(&code);
+        self.code.insert(hash, code);
+        self.account_mut(address).code_hash = hash;
+    }
+
+    /// Writes one storage slot. Writing zero deletes the slot, so that the state
+    /// root does not depend on whether a slot was ever touched.
+    ///
+    /// This does not refresh `storage_root`; call
+    /// [`WorldState::refresh_storage_root`] once a batch of writes is done.
+    pub fn set_storage(&mut self, address: Address, slot: U256, value: U256) {
+        if value.is_zero() {
+            if let Some(slots) = self.storage.get_mut(&address) {
+                slots.remove(&slot);
+                if slots.is_empty() {
+                    self.storage.remove(&address);
+                }
+            }
+        } else {
+            self.storage.entry(address).or_default().insert(slot, value);
+        }
+    }
+
+    /// Recomputes the `storage_root` commitment for `address` from its slots.
+    pub fn refresh_storage_root(&mut self, address: Address) {
+        let root = self
+            .storage
+            .get(&address)
+            .map(storage_root_of)
+            .unwrap_or(B256::ZERO);
+        if let Some(account) = self.accounts.get_mut(&address) {
+            account.storage_root = root;
+        }
+    }
+
+    /// Deletes an account and its storage, as `SELFDESTRUCT` does.
+    ///
+    /// The code itself stays in the code map: other accounts may share it, and
+    /// code is addressed by hash precisely so it never needs reference counting.
+    pub fn remove_account(&mut self, address: &Address) {
+        self.accounts.remove(address);
+        self.storage.remove(address);
+    }
+}
+
+/// Commits to one account's storage in a single hash.
+///
+/// Slots are sorted first so the root never depends on `HashMap` order, and an
+/// empty storage commits to zero. Ethereum uses a Merkle-Patricia trie here; this
+/// commits to the same contents but cannot produce inclusion proofs.
+pub fn storage_root_of(slots: &HashMap<U256, U256>) -> B256 {
+    if slots.is_empty() {
+        return B256::ZERO;
+    }
+    let mut entries: Vec<(&U256, &U256)> = slots.iter().collect();
+    entries.sort_by_key(|(slot, _)| **slot);
+
+    let mut buf = Vec::with_capacity(entries.len() * 64);
+    for (slot, value) in entries {
+        buf.extend_from_slice(&slot.to_be_bytes::<32>());
+        buf.extend_from_slice(&value.to_be_bytes::<32>());
+    }
+    keccak256(buf)
 }
 
 impl BlockHeader {
@@ -328,7 +465,7 @@ impl BlockState {
         }
 
         let mut state = Self {
-            accounts,
+            world: WorldState::from_accounts(accounts),
             ..Default::default()
         };
 
@@ -337,7 +474,7 @@ impl BlockState {
         let header = BlockHeader {
             number: 0,
             parent_hash: B256::ZERO,
-            state_root: state_root_of(&state.accounts),
+            state_root: state_root_of(&state.world.accounts),
             transaction_root: B256::ZERO,
             receipts_root: B256::ZERO,
             difficulty,
@@ -368,7 +505,7 @@ impl BlockState {
 
         state.block_index.insert(genesis.hash, 0);
         state.blocks.push(genesis);
-        state.state_history.push(state.accounts.clone());
+        state.state_history.push(state.world.clone());
         state
     }
 
@@ -406,7 +543,7 @@ impl BlockState {
     /// Account at the chain head. An address nobody has ever funded reads as an
     /// empty account rather than an error, exactly as on Ethereum.
     pub fn get_account(&self, address: &Address) -> Account {
-        self.accounts.get(address).cloned().unwrap_or_default()
+        self.world.account(address)
     }
 
     /// Account as it was after block `number`, or `None` if that block does not
@@ -414,7 +551,33 @@ impl BlockState {
     pub fn get_account_at(&self, address: &Address, number: u64) -> Option<Account> {
         self.state_history
             .get(number as usize)
-            .map(|snapshot| snapshot.get(address).cloned().unwrap_or_default())
+            .map(|snapshot| snapshot.account(address))
+    }
+
+    /// Runtime code at `address` as of block `number`: empty for an account with
+    /// no code, `None` if that block does not exist.
+    pub fn get_code_at(&self, address: &Address, number: u64) -> Option<Bytes> {
+        self.state_history
+            .get(number as usize)
+            .map(|snapshot| snapshot.code_of(address))
+    }
+
+    /// One storage slot of `address` as of block `number`: zero if never written,
+    /// `None` if that block does not exist.
+    pub fn get_storage_at(&self, address: &Address, slot: U256, number: u64) -> Option<U256> {
+        self.state_history
+            .get(number as usize)
+            .map(|snapshot| snapshot.storage_at(address, slot))
+    }
+
+    /// Hashes of the most recent 256 blocks by number — the window the
+    /// `BLOCKHASH` opcode can see.
+    pub fn recent_block_hashes(&self) -> HashMap<u64, B256> {
+        let start = self.blocks.len().saturating_sub(256);
+        self.blocks[start..]
+            .iter()
+            .map(|block| (block.number, block.hash))
+            .collect()
     }
 
     /// The nonce the sender's *next* transaction must carry: the mined nonce plus
@@ -440,13 +603,13 @@ impl BlockState {
 
     /// Commits to the account set at the chain head in a single hash.
     pub fn state_root(&self) -> B256 {
-        state_root_of(&self.accounts)
+        state_root_of(&self.world.accounts)
     }
 
-    /// A copy of the account state at the head, for the miner to execute against
-    /// without holding the state lock.
-    pub fn accounts_snapshot(&self) -> HashMap<Address, Account> {
-        self.accounts.clone()
+    /// A copy of the world state at the head, for the miner (and later the EVM)
+    /// to execute against without holding the state lock.
+    pub fn world_snapshot(&self) -> WorldState {
+        self.world.clone()
     }
 
     // mempool
@@ -479,13 +642,13 @@ impl BlockState {
 
     /// Installs a sealed block as the new chain head.
     ///
-    /// `accounts` is the state the miner produced by executing `transactions`, and
+    /// `world` is the state the miner produced by executing `transactions`, and
     /// it replaces the head state wholesale. This is safe because the miner is
     /// the only writer of account state; the JSON-RPC server only ever appends to
     /// the mempool.
     pub fn commit_block(
         &mut self,
-        accounts: HashMap<Address, Account>,
+        world: WorldState,
         block: Block,
         transactions: Vec<Transaction>,
         receipts: Vec<TransactionReceipt>,
@@ -494,7 +657,7 @@ impl BlockState {
         self.mempool
             .retain(|pending| !mined.contains(&pending.hash));
 
-        self.accounts = accounts;
+        self.world = world;
         self.block_index.insert(block.hash, block.number);
         for tx in transactions {
             self.transactions.insert(tx.hash, tx);
@@ -503,7 +666,7 @@ impl BlockState {
             self.receipts.insert(receipt.transaction_hash, receipt);
         }
         self.blocks.push(block);
-        self.state_history.push(self.accounts.clone());
+        self.state_history.push(self.world.clone());
     }
 
     /// Default gas price for a node with no fee market: a constant.
@@ -631,5 +794,84 @@ mod tests {
         assert!(state.get_pending_balance(&sender) < one_eth * U256::from(9u64));
         assert_eq!(state.mempool_len(), 1);
         assert!(state.mempool_contains(&B256::repeat_byte(0xaa)));
+    }
+
+    #[test]
+    fn code_is_stored_once_by_hash_and_found_by_address() {
+        let a = Address::repeat_byte(0x01);
+        let b = Address::repeat_byte(0x02);
+        let code = Bytes::from_static(&[0x60, 0x2a, 0x00]);
+
+        let mut world = WorldState::default();
+        world.set_code(a, code.clone());
+        world.set_code(b, code.clone());
+
+        assert_eq!(world.code_of(&a), code);
+        assert_eq!(world.code_of(&b), code);
+        assert_eq!(world.account(&a).code_hash, keccak256(&code));
+        // Two contracts, one copy of the bytecode.
+        assert_eq!(world.code.len(), 1);
+        // An account with no code reads as empty code.
+        assert!(world.code_of(&Address::repeat_byte(0x03)).is_empty());
+    }
+
+    #[test]
+    fn writing_zero_deletes_a_slot_so_equal_storage_hashes_equal() {
+        let a = Address::repeat_byte(0x01);
+        let mut world = WorldState::default();
+        world.account_mut(a);
+        let empty_root = {
+            world.refresh_storage_root(a);
+            world.account(&a).storage_root
+        };
+        assert_eq!(empty_root, B256::ZERO);
+
+        world.set_storage(a, U256::from(7), U256::from(42));
+        world.refresh_storage_root(a);
+        assert_eq!(world.storage_at(&a, U256::from(7)), U256::from(42));
+        assert_ne!(world.account(&a).storage_root, B256::ZERO);
+
+        // Clearing the slot returns the account to exactly the state it had
+        // before it was ever written.
+        world.set_storage(a, U256::from(7), U256::ZERO);
+        world.refresh_storage_root(a);
+        assert_eq!(world.storage_at(&a, U256::from(7)), U256::ZERO);
+        assert!(!world.storage.contains_key(&a));
+        assert_eq!(world.account(&a).storage_root, B256::ZERO);
+    }
+
+    #[test]
+    fn the_storage_root_changes_with_any_slot_and_ignores_map_ordering() {
+        let mut one = HashMap::new();
+        one.insert(U256::from(1), U256::from(10));
+        one.insert(U256::from(2), U256::from(20));
+
+        let mut two = HashMap::new();
+        two.insert(U256::from(2), U256::from(20));
+        two.insert(U256::from(1), U256::from(10));
+        assert_eq!(storage_root_of(&one), storage_root_of(&two));
+
+        two.insert(U256::from(2), U256::from(21));
+        assert_ne!(storage_root_of(&one), storage_root_of(&two));
+    }
+
+    #[test]
+    fn removing_an_account_drops_its_storage() {
+        let a = Address::repeat_byte(0x01);
+        let mut world = WorldState::default();
+        world.account_mut(a).balance = U256::from(5);
+        world.set_storage(a, U256::from(1), U256::from(1));
+
+        world.remove_account(&a);
+        assert_eq!(world.account(&a), Account::default());
+        assert_eq!(world.storage_at(&a, U256::from(1)), U256::ZERO);
+    }
+
+    #[test]
+    fn recent_block_hashes_include_genesis_on_a_fresh_chain() {
+        let state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+        let hashes = state.recent_block_hashes();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[&0], state.head().hash);
     }
 }

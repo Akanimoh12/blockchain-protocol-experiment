@@ -51,10 +51,10 @@ fn run(chain: Chain) {
     while !chain.is_shutting_down() {
         // snapshot the chain, holding the read lock only briefly
         let generation = chain.mempool_generation();
-        let (accounts, parent, batch) = {
+        let (world, parent, batch) = {
             let state = chain.read();
             (
-                state.accounts_snapshot(),
+                state.world_snapshot(),
                 state.head().clone(),
                 state.peek_mempool_batch(),
             )
@@ -63,7 +63,7 @@ fn run(chain: Chain) {
         let number = parent.number + 1;
 
         // execute the candidate block, with no lock held
-        let execution = execute_block(accounts, &batch, number, config.miner);
+        let execution = execute_block(world, &batch, number, config.miner);
 
         let mut header = BlockHeader {
             number,
@@ -139,7 +139,7 @@ fn run(chain: Chain) {
                 continue;
             }
             block.transactions = transactions.iter().map(|tx| tx.hash).collect();
-            state.commit_block(execution.accounts, block, transactions, receipts);
+            state.commit_block(execution.world, block, transactions, receipts);
         }
 
         tracing::info!(

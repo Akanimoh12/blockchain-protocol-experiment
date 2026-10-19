@@ -3,13 +3,15 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, B256, U256};
 use primitives::{
     constants::{BLOCK_REWARD, TRANSFER_GAS},
-    node::{Account, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    node::{
+        Account, PendingTransaction, Transaction, TransactionReceipt, WorldState, hash_list_root,
+    },
 };
 
 /// What executing a batch of transactions produced.
 pub struct Execution {
-    /// Account state after the batch, ready to become the new head state.
-    pub accounts: HashMap<Address, Account>,
+    /// World state after the batch, ready to become the new head state.
+    pub world: WorldState,
     pub transactions: Vec<Transaction>,
     pub receipts: Vec<TransactionReceipt>,
     pub gas_used: u64,
@@ -77,7 +79,7 @@ pub fn pay_block_reward(
 /// it reaches the mempool, so the only failures left are races — a nonce that
 /// another transaction already used — and those are better dropped than mined.
 pub fn execute_block(
-    mut accounts: HashMap<Address, Account>,
+    mut world: WorldState,
     batch: &[PendingTransaction],
     block_number: u64,
     miner: Address,
@@ -87,7 +89,7 @@ pub fn execute_block(
     let mut gas_used = 0u64;
 
     for tx in batch {
-        match apply_transfer(&mut accounts, tx, miner) {
+        match apply_transfer(&mut world.accounts, tx, miner) {
             Ok(tx_gas) => {
                 let index = transactions.len() as u64;
                 gas_used += tx_gas;
@@ -133,7 +135,7 @@ pub fn execute_block(
 
     // The miner's reward is paid after the transactions, so a miner cannot spend
     // it inside the very block that grants it.
-    if let Err(error) = pay_block_reward(&mut accounts, miner) {
+    if let Err(error) = pay_block_reward(&mut world.accounts, miner) {
         tracing::error!(%error, "failed to pay block reward");
     }
 
@@ -143,8 +145,8 @@ pub fn execute_block(
     Execution {
         transaction_root: hash_list_root(&tx_hashes),
         receipts_root: hash_list_root(&receipt_hashes),
-        state_root: primitives::node::state_root_of(&accounts),
-        accounts,
+        state_root: primitives::node::state_root_of(&world.accounts),
+        world,
         transactions,
         receipts,
         gas_used,
@@ -165,6 +167,13 @@ mod tests {
         let mut accounts = HashMap::new();
         accounts.insert(DEV_ADDRESS, Account::new(balance));
         accounts
+    }
+
+    // `execute_block` now takes the whole world (accounts + code + storage)
+    // rather than a bare account map. The assertions below are unchanged; only
+    // the plumbing that feeds them is.
+    fn funded_world(balance: U256) -> WorldState {
+        WorldState::from_accounts(funded(balance))
     }
 
     fn transfer(value: U256, nonce: u64) -> PendingTransaction {
@@ -235,10 +244,10 @@ mod tests {
     #[test]
     fn executing_a_block_pays_the_reward_and_records_receipts() {
         let miner = Address::repeat_byte(0x99);
-        let accounts = funded(one_eth() * U256::from(10u64));
+        let world = funded_world(one_eth() * U256::from(10u64));
         let batch = vec![transfer(one_eth(), 0)];
 
-        let execution = execute_block(accounts, &batch, 1, miner);
+        let execution = execute_block(world, &batch, 1, miner);
 
         assert_eq!(execution.transactions.len(), 1);
         assert_eq!(execution.receipts.len(), 1);
@@ -247,7 +256,7 @@ mod tests {
         assert_eq!(execution.receipts[0].cummulative_gas_used, TRANSFER_GAS);
 
         let fee = U256::from(TRANSFER_GAS) * U256::from(GAS_PRICE);
-        assert_eq!(execution.accounts[&miner].balance, BLOCK_REWARD + fee);
+        assert_eq!(execution.world.accounts[&miner].balance, BLOCK_REWARD + fee);
 
         // Non-empty roots, because this block committed to a transaction.
         assert_ne!(execution.transaction_root, B256::ZERO);
@@ -257,22 +266,22 @@ mod tests {
     #[test]
     fn an_empty_block_still_pays_the_miner_but_commits_to_no_transactions() {
         let miner = Address::repeat_byte(0x99);
-        let execution = execute_block(funded(one_eth()), &[], 1, miner);
+        let execution = execute_block(funded_world(one_eth()), &[], 1, miner);
 
         assert!(execution.transactions.is_empty());
         assert_eq!(execution.gas_used, 0);
         assert_eq!(execution.transaction_root, B256::ZERO);
-        assert_eq!(execution.accounts[&miner].balance, BLOCK_REWARD);
+        assert_eq!(execution.world.accounts[&miner].balance, BLOCK_REWARD);
     }
 
     #[test]
     fn a_transaction_that_no_longer_applies_is_skipped_not_mined() {
         let miner = Address::repeat_byte(0x99);
-        let accounts = funded(one_eth() * U256::from(10u64));
+        let world = funded_world(one_eth() * U256::from(10u64));
         // Two transactions claiming the same nonce: only the first can apply.
         let batch = vec![transfer(one_eth(), 0), transfer(one_eth(), 0)];
 
-        let execution = execute_block(accounts, &batch, 1, miner);
+        let execution = execute_block(world, &batch, 1, miner);
         assert_eq!(execution.transactions.len(), 1);
     }
 }
