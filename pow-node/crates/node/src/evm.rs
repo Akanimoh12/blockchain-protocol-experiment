@@ -14,14 +14,123 @@
 
 use std::{collections::HashMap, convert::Infallible};
 
-use alloy::primitives::{Address, B256};
-use primitives::node::WorldState;
+use alloy::primitives::{Address, B256, U256};
+use primitives::{
+    constants::{BLOCK_GAS_LIMIT, CHAIN_ID},
+    node::{PendingTransaction, WorldState},
+};
 use revm::{
-    Database, DatabaseCommit,
+    Context, Database, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
     bytecode::Bytecode,
-    primitives::{AddressMap, KECCAK_EMPTY, StorageKey, StorageValue},
+    context::{BlockEnv, CfgEnv, TxEnv, result::EVMError},
+    primitives::{AddressMap, KECCAK_EMPTY, StorageKey, StorageValue, TxKind, hardfork::SpecId},
     state::{Account as EvmAccount, AccountInfo},
 };
+
+/// Why REVM refused to execute a transaction at all.
+///
+/// This is *not* a revert. An `Err` here means the transaction was invalid —
+/// wrong nonce, unable to afford its gas, a gas limit above the block's — and
+/// it must be skipped, not mined. A transaction that runs and then fails is an
+/// `Ok` with an unsuccessful outcome.
+pub type InvalidTransaction = EVMError<Infallible>;
+
+/// What the EVM needs to know about the block a transaction runs in.
+///
+/// All of it must be known *before* execution, which is before mining: the
+/// block's own hash does not exist yet, because finding it is what proof of
+/// work does next.
+#[derive(Debug, Clone)]
+pub struct BlockContext {
+    pub number: u64,
+    pub timestamp: u64,
+    /// Receives the transaction fees. REVM pays this address itself.
+    pub miner: Address,
+    pub difficulty: u8,
+    pub parent_hash: B256,
+}
+
+/// What executing one transaction produced.
+#[derive(Debug, Clone)]
+pub struct TxOutcome {
+    /// `true` if execution completed; `false` if it reverted or halted.
+    pub success: bool,
+    /// Gas actually charged, after refunds.
+    pub gas_used: u64,
+}
+
+impl BlockContext {
+    fn block_env(&self) -> BlockEnv {
+        BlockEnv {
+            number: U256::from(self.number),
+            // REVM credits `gas_used * gas_price` to this address. Breeja must
+            // not pay the fee a second time by hand.
+            beneficiary: self.miner,
+            timestamp: U256::from(self.timestamp),
+            gas_limit: BLOCK_GAS_LIMIT,
+            // Breeja is pre-EIP-1559: one fixed gas price and no burn. Any
+            // non-zero basefee would destroy part of every fee.
+            basefee: 0,
+            difficulty: U256::from(self.difficulty),
+            // Under Shanghai rules `DIFFICULTY` reads this instead. The parent's
+            // hash is the freshest randomness that exists before mining.
+            prevrandao: Some(self.parent_hash),
+            ..Default::default()
+        }
+    }
+}
+
+/// Frontier-era consensus, Shanghai-era execution: modern Solidity needs
+/// opcodes like `PUSH0` that Frontier never had, and Shanghai is the newest
+/// fork that does not also need blob-gas fields in the block.
+fn cfg_env() -> CfgEnv {
+    CfgEnv::new_with_spec(SpecId::SHANGHAI).with_chain_id(CHAIN_ID)
+}
+
+fn tx_env(tx: &PendingTransaction) -> TxEnv {
+    TxEnv {
+        tx_type: 0, // legacy
+        caller: tx.from,
+        gas_limit: tx.gas,
+        gas_price: tx.gas_price,
+        kind: TxKind::Call(tx.to),
+        value: tx.value,
+        nonce: tx.nonce,
+        chain_id: Some(tx.chain_id),
+        ..Default::default()
+    }
+}
+
+/// Runs one transaction through REVM and commits its effects to `db`.
+///
+/// REVM does the whole state transition: it checks the nonce and balance,
+/// charges the sender for the full gas limit, moves the value, refunds unused
+/// gas, bumps the nonce and pays the fee to the block's beneficiary. None of
+/// that is repeated here.
+pub fn execute_transaction(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    tx: &PendingTransaction,
+) -> Result<TxOutcome, InvalidTransaction> {
+    let mut evm = Context::mainnet()
+        .with_db(&mut *db)
+        .with_block(block.block_env())
+        .with_cfg(cfg_env())
+        .build_mainnet();
+
+    let outcome = evm.transact(tx_env(tx))?;
+    let summary = TxOutcome {
+        success: outcome.result.is_success(),
+        gas_used: outcome.result.tx_gas_used(),
+    };
+
+    // The EVM holds `db` mutably for as long as it lives, so it has to go
+    // before the changes can be written back.
+    drop(evm);
+    db.commit(outcome.state);
+
+    Ok(summary)
+}
 
 /// A snapshot of chain state that REVM can read from and write back to.
 #[derive(Debug, Clone, Default)]

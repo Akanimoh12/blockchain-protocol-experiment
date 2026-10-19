@@ -22,7 +22,7 @@ use primitives::{
     node::{Block, BlockHeader, retarget_difficulty},
 };
 
-use crate::{chain::Chain, executor::execute_block, pow};
+use crate::{chain::Chain, evm::BlockContext, executor::execute_block, pow};
 
 /// Starts the miner on its own OS thread.
 ///
@@ -51,10 +51,11 @@ fn run(chain: Chain) {
     while !chain.is_shutting_down() {
         // snapshot the chain, holding the read lock only briefly
         let generation = chain.mempool_generation();
-        let (world, parent, batch) = {
+        let (world, block_hashes, parent, batch) = {
             let state = chain.read();
             (
                 state.world_snapshot(),
+                state.recent_block_hashes(),
                 state.head().clone(),
                 state.peek_mempool_batch(),
             )
@@ -62,8 +63,20 @@ fn run(chain: Chain) {
 
         let number = parent.number + 1;
 
+        // Everything the EVM can observe about this block must be fixed before
+        // it runs. In particular the timestamp is chosen here, not after
+        // execution, because contracts can read it.
+        let block = BlockContext {
+            number,
+            // A block's timestamp must advance, even if the system clock does not.
+            timestamp: unix_now().max(parent.timestamp + 1),
+            miner: config.miner,
+            difficulty,
+            parent_hash: parent.hash,
+        };
+
         // execute the candidate block, with no lock held
-        let execution = execute_block(world, &batch, number, config.miner);
+        let execution = execute_block(world, block_hashes, &batch, &block);
 
         let mut header = BlockHeader {
             number,
@@ -72,8 +85,7 @@ fn run(chain: Chain) {
             transaction_root: execution.transaction_root,
             receipts_root: execution.receipts_root,
             difficulty,
-            // A block's timestamp must advance, even if the system clock does not.
-            timestamp: unix_now().max(parent.timestamp + 1),
+            timestamp: block.timestamp,
             gas_limit: BLOCK_GAS_LIMIT,
             gas_used: execution.gas_used,
             miner: config.miner,
