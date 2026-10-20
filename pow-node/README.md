@@ -84,9 +84,30 @@ must never hold real funds.**
 
 ## Sending a transaction
 
-Breeja does not implement `eth_gasPrice`, so `cast send` cannot auto-fill its
-parameters. Build and sign the transaction offline with `cast mktx`, then submit
-the raw bytes.
+Breeja serves `eth_gasPrice`, so `cast send` fills in the price, nonce and gas
+itself:
+
+```bash
+export ETH_RPC_URL=http://127.0.0.1:8545
+PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+# a transfer
+cast send --legacy --private-key $PK 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --value 1ether
+
+# deploy a contract (this one stores 42 in slot 0 and emits a log when called)
+cast send --legacy --private-key $PK --create 0x600b600c600039600b6000f3602a60005560006000a000
+
+# call it, then inspect it
+cast send --legacy --private-key $PK <CONTRACT_ADDRESS>
+cast code <CONTRACT_ADDRESS>
+cast storage <CONTRACT_ADDRESS> 0
+cast logs --address <CONTRACT_ADDRESS> --from-block 0
+```
+
+### Without cast send
+
+You can also build and sign the transaction offline with `cast mktx`, then
+submit the raw bytes yourself.
 
 ```bash
 RAW=$(cast mktx --legacy \
@@ -113,7 +134,7 @@ client waits for confirmation.
 
 ## The JSON-RPC API
 
-The same eleven methods from the assignment, now backed by real state.
+The eleven methods from the assignment, plus the four a node with an EVM needs.
 
 | Method | Behaviour |
 | --- | --- |
@@ -125,9 +146,13 @@ The same eleven methods from the assignment, now backed by real state.
 | `eth_getTransactionReceipt` | Receipts for mined transactions; `null` while pending |
 | `eth_getBalance` | Balance at any historical block, or `pending` |
 | `eth_getTransactionCount` | Nonce; `pending` includes queued transactions |
-| `eth_sendRawTransaction` | Validates and queues a signed transfer |
-| `eth_call` | `0x` for a plain transfer; **error** if it needs the EVM |
-| `eth_estimateGas` | `0x5208` (21000); **error** if it needs the EVM |
+| `eth_sendRawTransaction` | Validates and queues a signed transfer, deployment or contract call |
+| `eth_call` | Executes against any block's state and discards the changes; a revert is error code `3` with the revert data |
+| `eth_estimateGas` | Executes to find the smallest gas limit that succeeds; exactly `0x5208` for a transfer |
+| `eth_gasPrice` | `0x3b9aca00` (1 gwei, fixed) |
+| `eth_getCode` | Runtime code at an address and block; `0x` if none |
+| `eth_getStorageAt` | One storage slot as a 32-byte word |
+| `eth_getLogs` | Logs by block range or `blockHash`, `address` (one or many) and `topics` (with `null` wildcards and OR-lists) |
 
 Anything else returns `-32601 Method not found`.
 
