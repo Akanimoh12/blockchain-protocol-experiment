@@ -129,7 +129,8 @@ pub struct TransactionReceipt {
     pub from: Address,
     pub to: Option<Address>,
     pub gas_used: u64,
-    pub cummulative_gas_used: u64,
+    /// Gas used by this transaction and every one before it in the block.
+    pub cumulative_gas_used: u64,
     pub effective_gas_price: u128,
     /// The address a deployment created; `None` for everything else, including
     /// a deployment that reverted.

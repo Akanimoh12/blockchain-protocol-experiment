@@ -126,7 +126,7 @@ pub fn execute_block(
             from: tx.from,
             to: tx.to,
             gas_used: outcome.gas_used,
-            cummulative_gas_used: gas_used,
+            cumulative_gas_used: gas_used,
             effective_gas_price: tx.gas_price,
             contract_address: outcome.created_address,
             logs,
@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(execution.receipts.len(), 1);
         assert_eq!(execution.receipts[0].status, 1);
         assert_eq!(execution.gas_used, TRANSFER_GAS);
-        assert_eq!(execution.receipts[0].cummulative_gas_used, TRANSFER_GAS);
+        assert_eq!(execution.receipts[0].cumulative_gas_used, TRANSFER_GAS);
 
         let fee = U256::from(TRANSFER_GAS) * U256::from(GAS_PRICE);
         assert_eq!(execution.world.accounts[&miner()].balance, BLOCK_REWARD + fee);

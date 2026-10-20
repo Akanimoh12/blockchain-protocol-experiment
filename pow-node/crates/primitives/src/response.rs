@@ -1,6 +1,9 @@
 use std::fmt::LowerHex;
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::{
+    consensus::EMPTY_OMMER_ROOT_HASH,
+    primitives::{Address, B256, Bytes},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -60,6 +63,17 @@ pub struct BlockResponse {
     /// Transaction hashes, or full transaction objects when the caller asked for
     /// them with the `fullTransactions` flag.
     pub transactions: Vec<serde_json::Value>,
+    // The three fields below are part of every Ethereum header, and clients such
+    // as cast refuse to parse a block without them. Breeja has no uncles and no
+    // Ethash, so each reports the honest empty value rather than being omitted.
+    /// The hash of an empty uncle list: Breeja never includes uncles.
+    #[serde(rename = "sha3Uncles")]
+    pub sha3_uncles: String,
+    pub uncles: Vec<String>,
+    /// Zero: Breeja's proof of work is a plain keccak search with no Ethash mix.
+    pub mix_hash: String,
+    /// Still 256 zero bytes: a block-level bloom filter is milestone 6.
+    pub logs_bloom: String,
 }
 
 /// A transaction, as `eth_getTransactionByHash` returns it.
@@ -99,7 +113,9 @@ pub struct TransactionReceiptResponse {
     /// `null` for a contract deployment.
     pub to: Option<String>,
     pub gas_used: String,
-    pub cummulative_gas_used: String,
+    /// Was misspelled `cummulativeGasUsed`, which standard clients such as cast
+    /// could not parse a receipt without.
+    pub cumulative_gas_used: String,
     pub effective_gas_price: String,
     /// The created contract for a successful deployment, otherwise `null`.
     pub contract_address: Option<String>,
@@ -149,6 +165,10 @@ impl BlockResponse {
             nonce: data_u64(block.nonce),
             size: quantity(block_size(block)),
             transactions,
+            sha3_uncles: data_hash(&EMPTY_OMMER_ROOT_HASH),
+            uncles: Vec::new(),
+            mix_hash: data_hash(&B256::ZERO),
+            logs_bloom: format!("0x{}", "00".repeat(256)),
         }
     }
 }
@@ -186,7 +206,7 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
             from: data_address(&receipt.from),
             to: receipt.to.as_ref().map(data_address),
             gas_used: quantity(receipt.gas_used),
-            cummulative_gas_used: quantity(receipt.cummulative_gas_used),
+            cumulative_gas_used: quantity(receipt.cumulative_gas_used),
             effective_gas_price: quantity(receipt.effective_gas_price),
             contract_address: receipt.contract_address.as_ref().map(data_address),
             logs: receipt.logs.iter().map(LogResponse::from).collect(),
