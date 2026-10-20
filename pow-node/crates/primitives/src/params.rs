@@ -80,19 +80,11 @@ pub struct CallRequest {
 
 impl CallRequest {
     /// The calldata this request carries, under whichever name it was sent.
-    ///
-    /// Breeja uses this to decide whether it can answer at all: calldata means
-    /// contract code, and there is no EVM to run it.
     pub fn calldata(&self) -> Bytes {
         self.data
             .clone()
             .or_else(|| self.input.clone())
             .unwrap_or_default()
-    }
-
-    /// Whether this request needs an EVM to answer.
-    pub fn needs_evm(&self) -> bool {
-        !self.calldata().is_empty() || self.to.is_none()
     }
 }
 
@@ -122,23 +114,29 @@ mod tests {
         assert!(BlockTag::Number(10).resolve(9).is_err());
     }
 
+    // Replaces `a_call_needs_an_evm_when_it_carries_calldata_or_creates_a_contract`.
+    // That test pinned down `needs_evm()`, which decided whether the node could
+    // answer at all. With an EVM every request can be answered, so the method and
+    // its test are gone; what remains to get right is reading the calldata.
     #[test]
-    fn a_call_needs_an_evm_when_it_carries_calldata_or_creates_a_contract() {
-        let transfer = CallRequest {
-            to: Some(Address::ZERO),
+    fn calldata_is_read_from_either_field_name() {
+        let bytes = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let as_data = CallRequest {
+            data: Some(bytes.clone()),
             ..Default::default()
         };
-        assert!(!transfer.needs_evm());
-
-        let contract_call = CallRequest {
-            to: Some(Address::ZERO),
-            data: Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
+        let as_input = CallRequest {
+            input: Some(bytes.clone()),
             ..Default::default()
         };
-        assert!(contract_call.needs_evm());
+        assert_eq!(as_data.calldata(), bytes);
+        assert_eq!(as_input.calldata(), bytes);
+        assert!(CallRequest::default().calldata().is_empty());
 
-        // No `to` at all is a contract deployment.
-        let deployment = CallRequest::default();
-        assert!(deployment.needs_evm());
+        // `to` is still optional: no recipient means a deployment.
+        let deployment: CallRequest = serde_json::from_str(r#"{"data":"0x6000"}"#).unwrap();
+        assert_eq!(deployment.to, None);
+        assert_eq!(deployment.calldata(), Bytes::from_static(&[0x60, 0x00]));
     }
 }
