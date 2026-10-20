@@ -29,11 +29,36 @@ is a memoryless search, so a block taking 4x the average is unremarkable.
 
 ### Execution
 
-The state transition is in `crates/node/src/executor.rs`, and it is short enough
-to read in one sitting: check the nonce, debit `value + fee` from the sender,
-credit `value` to the recipient, credit the fee to the miner, bump the nonce.
-Afterwards the miner is paid the block reward — the only way new ETH is ever
-created.
+Transactions run in REVM. Breeja doesn't hand the EVM its state; the EVM *asks*
+for it. A contract can touch any account or storage slot, so nobody knows in
+advance what it will need. `BreejaDb` (`crates/node/src/evm.rs`) wraps a snapshot
+of the world (accounts, code by hash, storage) and answers REVM's `Database`
+questions as they come. When a transaction finishes, `DatabaseCommit` writes back
+every account REVM marked as touched.
+
+REVM does the whole state transition:
+- checks the nonce and balance
+- charges the sender for the full gas limit
+- runs the code
+- refunds unused gas
+- bumps the nonce
+- pays the fee to the block's beneficiary
+
+Breeja adds only the block reward afterwards, which is still the only way new ETH
+is created.
+
+A transaction can fail in two very different ways. If REVM refuses it outright
+(wrong nonce, can't afford its gas), it's invalid and skipped. If it runs and then
+reverts or runs out of gas, it's valid: it's mined with `status: 0`, the sender
+still pays for the gas it burned, and its nonce is still used.
+
+Blocks fill by the gas their transactions actually use. Each transaction's gas
+limit has to fit in whatever the block has left. The state root commits to every
+account's balance and nonce, its code hash, and a root of its storage. Each block
+also carries a bloom filter over its logs, in the hashed header.
+
+The EVM follows Shanghai rules (so modern Solidity runs) with a basefee of zero
+(so nothing is burned), on top of Frontier-style proof of work.
 
 ### Signatures
 
@@ -55,3 +80,9 @@ only for the instant it takes to commit. The RPC server never blocks on mining.
 The miner also abandons a block in progress when a new transaction arrives, rather
 than making that transaction wait out the current search. Real miners do the same,
 for the same reason.
+
+`eth_call` and `eth_estimateGas` follow the same rule. They copy the state they need
+under the read lock, release it, and execute against the copy through REVM's
+read-only `DatabaseRef`, so nothing they do can be committed. A gas estimate is
+about twenty executions, and it never blocks the miner or a transaction being
+submitted.
