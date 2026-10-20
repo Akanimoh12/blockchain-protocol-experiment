@@ -9,10 +9,10 @@ use node::evm::{
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, CHAIN_ID},
     node::BlockState,
-    params::{BlockTag, CallRequest},
+    params::{BlockTag, CallRequest, LogFilter},
     response::{
-        BlockResponse, TransactionReceiptResponse, TransactionResponse, data_bytes, data_hash,
-        quantity,
+        BlockResponse, LogResponse, TransactionReceiptResponse, TransactionResponse, data_bytes,
+        data_hash, quantity,
     },
 };
 use serde_json::Value;
@@ -224,6 +224,98 @@ pub fn send_raw_transaction_handler(params: Params<'_>, context: &RPCContext) ->
     Ok(data_hash(&hash))
 }
 
+
+/// The node's gas price: a constant, because Breeja has no fee market.
+///
+/// One line, but it is what lets `cast send` and wallets fill in a legacy
+/// transaction's price themselves instead of needing it spelled out.
+pub fn gas_price_handler(context: &RPCContext) -> String {
+    quantity(context.chain.read().gas_price())
+}
+
+/// Reads the block tag that trails an address-based query, defaulting to
+/// `latest`, and resolves it to a block number.
+fn trailing_block(
+    sequence: &mut jsonrpsee::types::params::ParamsSequence<'_>,
+    state: &BlockState,
+) -> Result<u64, ErrorObjectOwned> {
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+    resolve_tag(state, &tag)
+}
+
+/// The runtime code at an address, `0x` for an account with no code.
+pub fn get_code_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+
+    let state = context.chain.read();
+    let number = trailing_block(&mut sequence, &state)?;
+    let code = state.get_code_at(&address, number).unwrap_or_default();
+    Ok(data_bytes(&code))
+}
+
+/// One storage slot, always as a full 32-byte word, even when it holds zero.
+pub fn get_storage_at_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let slot: U256 = sequence.next()?;
+
+    let state = context.chain.read();
+    let number = trailing_block(&mut sequence, &state)?;
+    let value = state
+        .get_storage_at(&address, slot, number)
+        .unwrap_or_default();
+    Ok(data_hash(&B256::from(value)))
+}
+
+/// Logs matching a filter, oldest first.
+///
+/// The filter's block range picks which blocks to walk; `LogFilter::matches`
+/// applies the address and topic constraints to every log in them.
+pub fn get_logs_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<Value> {
+    let filter: LogFilter = params.one()?;
+    let state = context.chain.read();
+
+    let (from, to) = match filter.block_hash {
+        Some(hash) => {
+            if filter.from_block.is_some() || filter.to_block.is_some() {
+                return Err(invalid_params(
+                    "blockHash cannot be combined with fromBlock or toBlock",
+                ));
+            }
+            // An unknown block has no logs; geth answers the same way.
+            let Some(block) = state.get_block_by_hash(&hash) else {
+                return Ok(Value::Array(Vec::new()));
+            };
+            (block.number, block.number)
+        }
+        None => {
+            let from = resolve_tag(&state, &filter.from_block.unwrap_or(BlockTag::Latest))?;
+            let to = resolve_tag(&state, &filter.to_block.unwrap_or(BlockTag::Latest))?;
+            if from > to {
+                return Err(invalid_params(format!(
+                    "fromBlock {from} is after toBlock {to}"
+                )));
+            }
+            (from, to)
+        }
+    };
+
+    let logs: Vec<Value> = (from..=to)
+        .filter_map(|number| state.get_block(number))
+        .flat_map(|block| block.transactions.iter())
+        .filter_map(|hash| state.get_receipt(hash))
+        .flat_map(|receipt| receipt.logs.iter())
+        .filter(|log| filter.matches(log))
+        .map(|log| {
+            serde_json::to_value(LogResponse::from(log)).expect("a log response always serializes")
+        })
+        .collect();
+
+    Ok(Value::Array(logs))
+}
 
 /// Error code geth uses for a reverted call, with the revert data attached, so a
 /// client can decode the contract's reason.

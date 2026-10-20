@@ -150,3 +150,11 @@ pub const RETURN42_INITCODE: &str = "0x600a600c600039600a6000f3602a6000526020600
 /// Runtime: `JUMPDEST PUSH1 0 JUMP` — loops until it runs out of gas, so a call
 /// burns its entire gas limit.
 pub const LOOPER_INITCODE: &str = "0x6004600c60003960046000f35b600056";
+
+/// Runtime: `LOG1` with topic [`PING_TOPIC`] and no data, then `STOP`. Unlike
+/// STORE42's `LOG0`, this log has a topic to filter on.
+pub const PINGER_INITCODE: &str = "0x6027600c60003960276000f37fca6e822df923f741dfe968d15d80a18abd25bd1e748bcb9ad81fea5bbb7386af60006000a100";
+
+/// `keccak256("Ping()")`, the topic PINGER emits — what Solidity would use as
+/// the signature topic of an `event Ping()`.
+pub const PING_TOPIC: &str = "0xca6e822df923f741dfe968d15d80a18abd25bd1e748bcb9ad81fea5bbb7386af";

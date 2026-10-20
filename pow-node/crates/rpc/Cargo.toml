@@ -18,3 +18,4 @@ tracing.workspace = true
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 serde_json.workspace = true
+serde.workspace = true

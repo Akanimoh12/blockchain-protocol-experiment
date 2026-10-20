@@ -9,8 +9,9 @@ use jsonrpsee::{
 use node::{
     Chain, ChainConfig, miner,
     testing::{
-        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, RETURN42_INITCODE, REVERTER_INITCODE,
-        STORE42_INITCODE, address_of, one_eth, sign_call, sign_deploy, sign_transfer,
+        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, PING_TOPIC, PINGER_INITCODE, RETURN42_INITCODE,
+        REVERTER_INITCODE, STORE42_INITCODE, STORE42_RUNTIME, address_of, one_eth, sign_call,
+        sign_deploy, sign_transfer,
     },
 };
 use primitives::node::BreejaGenesis;
@@ -368,6 +369,9 @@ async fn a_transfer_produces_a_transaction_and_a_receipt() {
         .unwrap();
     assert_eq!(receipt["status"], "0x1");
     assert_eq!(receipt["gasUsed"], "0x5208");
+    // Spelled the way clients expect; it used to be `cummulativeGasUsed`.
+    assert_eq!(receipt["cumulativeGasUsed"], "0x5208");
+    assert!(receipt.get("cummulativeGasUsed").is_none());
     assert_eq!(receipt["from"], format!("{alice:#x}"));
     assert_eq!(receipt["to"], format!("{bob:#x}"));
     assert!(
@@ -658,6 +662,255 @@ async fn eth_estimate_gas_is_enough_to_actually_mine_the_transaction() {
     assert_eq!(from_quantity(receipt["gasUsed"].as_str().unwrap()) as u64, gas);
 }
 
+/// Parses a response the way alloy (and so cast, forge and most Rust clients)
+/// would, failing with the client's own complaint if the shape is wrong.
+fn parse_as<T: serde::de::DeserializeOwned>(what: &str, value: &Value) -> T {
+    serde_json::from_value(value.clone())
+        .unwrap_or_else(|e| panic!("a standard client cannot parse this {what}: {e}\n{value}"))
+}
+
+#[tokio::test]
+async fn standard_clients_can_parse_blocks_transactions_receipts_and_logs() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+
+    let deployed = send_and_wait(
+        &harness,
+        sign_deploy(DEV_PRIVATE_KEY, STORE42_INITCODE.parse().unwrap(), 0, 100_000).unwrap(),
+    )
+    .await;
+    let called = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, alice.create(0), Bytes::new(), 1, 100_000).unwrap(),
+    )
+    .await;
+
+    for receipt in [&deployed, &called] {
+        let parsed: alloy::rpc::types::TransactionReceipt = parse_as("receipt", receipt);
+        assert!(parsed.status());
+
+        let tx: Value = harness
+            .client
+            .request("eth_getTransactionByHash", rpc_params![receipt["transactionHash"].clone()])
+            .await
+            .unwrap();
+        let _: alloy::rpc::types::Transaction = parse_as("transaction", &tx);
+
+        let block: Value = harness
+            .client
+            .request("eth_getBlockByHash", rpc_params![receipt["blockHash"].clone(), true])
+            .await
+            .unwrap();
+        let _: alloy::rpc::types::Block = parse_as("block", &block);
+    }
+
+    let logs: Value = harness
+        .client
+        .request("eth_getLogs", rpc_params![serde_json::json!({"fromBlock": "earliest"})])
+        .await
+        .unwrap();
+    let logs: Vec<alloy::rpc::types::Log> = parse_as("log list", &logs);
+    assert_eq!(logs.len(), 1);
+}
+
+#[tokio::test]
+async fn eth_gas_price_returns_the_fixed_price() {
+    let harness = Harness::start(&[], false).await;
+    let price: String = harness
+        .client
+        .request("eth_gasPrice", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(price, "0x3b9aca00", "1 gwei");
+}
+
+#[tokio::test]
+async fn eth_get_code_returns_runtime_bytecode() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let contract = alice.create(0);
+
+    send_and_wait(
+        &harness,
+        sign_deploy(DEV_PRIVATE_KEY, STORE42_INITCODE.parse().unwrap(), 0, 100_000).unwrap(),
+    )
+    .await;
+
+    // The runtime the constructor returned, not the initcode that was sent.
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![contract, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(code, STORE42_RUNTIME);
+
+    // The block tag is optional, and defaults to latest.
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![contract])
+        .await
+        .unwrap();
+    assert_eq!(code, STORE42_RUNTIME);
+
+    // An account with no code, and the contract before it existed, are both `0x`.
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![alice, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(code, "0x");
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![contract, "earliest"])
+        .await
+        .unwrap();
+    assert_eq!(code, "0x");
+}
+
+#[tokio::test]
+async fn eth_get_storage_at_returns_a_32_byte_word() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let contract = alice.create(0);
+
+    send_and_wait(
+        &harness,
+        sign_deploy(DEV_PRIVATE_KEY, STORE42_INITCODE.parse().unwrap(), 0, 100_000).unwrap(),
+    )
+    .await;
+    let called = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap(),
+    )
+    .await;
+    let called_in = from_quantity(called["blockNumber"].as_str().unwrap());
+
+    let slot: String = harness
+        .client
+        .request("eth_getStorageAt", rpc_params![contract, "0x0", "latest"])
+        .await
+        .unwrap();
+    assert_eq!(slot, format!("0x{:064x}", 42));
+    assert_eq!(slot.len(), 66, "a full 32-byte word, not a minimal quantity");
+
+    // An unwritten slot is zero, still padded to 32 bytes.
+    let slot: String = harness
+        .client
+        .request("eth_getStorageAt", rpc_params![contract, "0x1", "latest"])
+        .await
+        .unwrap();
+    assert_eq!(slot, format!("0x{}", "0".repeat(64)));
+
+    // History: in the block before the call, slot 0 had not been written yet.
+    let slot: String = harness
+        .client
+        .request(
+            "eth_getStorageAt",
+            rpc_params![contract, "0x0", format!("{:#x}", called_in - 1)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(slot, format!("0x{}", "0".repeat(64)));
+}
+
+#[tokio::test]
+async fn eth_get_logs_filters_by_block_range_address_and_topic() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let store = alice.create(0);
+    let pinger = alice.create(1);
+
+    send_and_wait(
+        &harness,
+        sign_deploy(DEV_PRIVATE_KEY, STORE42_INITCODE.parse().unwrap(), 0, 100_000).unwrap(),
+    )
+    .await;
+    send_and_wait(
+        &harness,
+        sign_deploy(DEV_PRIVATE_KEY, PINGER_INITCODE.parse().unwrap(), 1, 100_000).unwrap(),
+    )
+    .await;
+    let stored = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, store, Bytes::new(), 2, 100_000).unwrap(),
+    )
+    .await;
+    let pinged = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, pinger, Bytes::new(), 3, 100_000).unwrap(),
+    )
+    .await;
+    let stored_in = stored["blockNumber"].as_str().unwrap().to_owned();
+    let pinged_in = pinged["blockNumber"].as_str().unwrap().to_owned();
+
+    let get_logs = |filter: Value| {
+        let client = harness.client.clone();
+        async move {
+            let logs: Vec<Value> = client
+                .request("eth_getLogs", rpc_params![filter])
+                .await
+                .unwrap();
+            logs
+        }
+    };
+
+    // By block range and address: exactly STORE42's log, as the receipt had it.
+    let logs = get_logs(serde_json::json!({
+        "fromBlock": "earliest", "toBlock": "latest", "address": store
+    }))
+    .await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0], stored["logs"][0]);
+    assert_eq!(logs[0]["address"], format!("{store:#x}"));
+
+    // A range that ends before the log's block finds nothing.
+    let before = format!("{:#x}", from_quantity(&stored_in) - 1);
+    let logs = get_logs(serde_json::json!({
+        "fromBlock": "earliest", "toBlock": before, "address": store
+    }))
+    .await;
+    assert!(logs.is_empty());
+
+    // A different address finds nothing; a list of both finds both.
+    let logs = get_logs(serde_json::json!({
+        "fromBlock": "earliest", "address": Address::repeat_byte(0x42)
+    }))
+    .await;
+    assert!(logs.is_empty());
+    let logs = get_logs(serde_json::json!({
+        "fromBlock": "earliest", "address": [store, pinger]
+    }))
+    .await;
+    assert_eq!(logs.len(), 2);
+
+    // By topic: only PINGER's LOG1 carries PING_TOPIC...
+    let logs = get_logs(serde_json::json!({
+        "fromBlock": "earliest", "topics": [PING_TOPIC]
+    }))
+    .await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["address"], format!("{pinger:#x}"));
+    assert_eq!(logs[0]["topics"][0], PING_TOPIC);
+    // ...and `[null]` means "has at least one topic", which rules out LOG0.
+    let logs = get_logs(serde_json::json!({ "fromBlock": "earliest", "topics": [null] })).await;
+    assert_eq!(logs.len(), 1);
+
+    // A single block by hash.
+    let logs = get_logs(serde_json::json!({ "blockHash": pinged["blockHash"] })).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["blockNumber"], pinged_in);
+
+    // An impossible range is an error, not an empty answer.
+    let result: Result<Vec<Value>, _> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"fromBlock": "latest", "toBlock": "earliest"})],
+        )
+        .await;
+    assert!(result.is_err());
+}
+
 #[tokio::test]
 async fn eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer() {
     let alice = address_of(DEV_PRIVATE_KEY).unwrap();
@@ -710,9 +963,13 @@ async fn eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer() {
 async fn an_unsupported_method_gets_the_standard_method_not_found_error() {
     let harness = Harness::start(&[], false).await;
 
-    // `eth_gasPrice` is a real Ethereum method this node does not implement, so it
-    // must come back as -32601 rather than something invented.
-    let result: Result<Value, _> = harness.client.request("eth_gasPrice", rpc_params![]).await;
+    // `eth_feeHistory` is a real Ethereum method this node does not implement, so
+    // it must come back as -32601 rather than something invented. (This test used
+    // `eth_gasPrice` until the node gained it.)
+    let result: Result<Value, _> = harness
+        .client
+        .request("eth_feeHistory", rpc_params!["0x1", "latest", Vec::<u8>::new()])
+        .await;
     let error = result.expect_err("an unregistered method must be an error");
     assert!(
         error.to_string().contains("Method not found") || error.to_string().contains("-32601"),
