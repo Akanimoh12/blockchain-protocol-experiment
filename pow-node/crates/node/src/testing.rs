@@ -36,17 +36,77 @@ pub fn sign_transfer_with(
     gas_price: u128,
     gas_limit: u64,
 ) -> Result<Bytes, anyhow::Error> {
+    sign_tx(
+        private_key,
+        TxKind::Call(to),
+        value,
+        Bytes::new(),
+        nonce,
+        gas_price,
+        gas_limit,
+    )
+}
+
+/// Signs a contract deployment: no recipient, and `initcode` as the input. The
+/// contract will live at `address_of(private_key).create(nonce)`.
+pub fn sign_deploy(
+    private_key: &str,
+    initcode: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_tx(
+        private_key,
+        TxKind::Create,
+        U256::ZERO,
+        initcode,
+        nonce,
+        GAS_PRICE,
+        gas_limit,
+    )
+}
+
+/// Signs a call to a contract with `calldata` and no value.
+pub fn sign_call(
+    private_key: &str,
+    to: Address,
+    calldata: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_tx(
+        private_key,
+        TxKind::Call(to),
+        U256::ZERO,
+        calldata,
+        nonce,
+        GAS_PRICE,
+        gas_limit,
+    )
+}
+
+/// Signs any legacy transaction and encodes it the way `eth_sendRawTransaction`
+/// expects.
+pub fn sign_tx(
+    private_key: &str,
+    to: TxKind,
+    value: U256,
+    input: Bytes,
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
     let signer: PrivateKeySigner = private_key.parse()?;
 
-    // 1. The unsigned transaction. `input` is empty because this node has no EVM.
+    // 1. The unsigned transaction.
     let tx = TxLegacy {
         chain_id: Some(CHAIN_ID),
         nonce,
         gas_price,
         gas_limit,
-        to: TxKind::Call(to),
+        to,
         value,
-        input: Bytes::new(),
+        input,
     };
 
     // 2 and 3. Sign the signature hash, which commits to every field above.
@@ -70,3 +130,23 @@ pub fn address_of(private_key: &str) -> Result<Address, anyhow::Error> {
 pub fn one_eth() -> U256 {
     U256::from(10u64).pow(U256::from(18))
 }
+
+// Hand-assembled test contracts. Each initcode is the same 12-byte prologue —
+// `PUSH1 len PUSH1 0x0c PUSH1 0 CODECOPY PUSH1 len PUSH1 0 RETURN`, which copies
+// the bytes after it into memory and returns them as the runtime code — followed
+// by that runtime. Read any of them with `cast disassemble <hex>`.
+
+/// Runtime: `sstore(0, 42)`, then `LOG0` with no data, then `STOP`.
+pub const STORE42_INITCODE: &str = "0x600b600c600039600b6000f3602a60005560006000a000";
+/// What `STORE42_INITCODE` leaves on chain.
+pub const STORE42_RUNTIME: &str = "0x602a60005560006000a000";
+
+/// Runtime: `REVERT(0, 0)` — every call to it fails.
+pub const REVERTER_INITCODE: &str = "0x6005600c60003960056000f360006000fd";
+
+/// Runtime: return the 32-byte word `42`.
+pub const RETURN42_INITCODE: &str = "0x600a600c600039600a6000f3602a60005260206000f3";
+
+/// Runtime: `JUMPDEST PUSH1 0 JUMP` — loops until it runs out of gas, so a call
+/// burns its entire gas limit.
+pub const LOOPER_INITCODE: &str = "0x6004600c60003960046000f35b600056";
