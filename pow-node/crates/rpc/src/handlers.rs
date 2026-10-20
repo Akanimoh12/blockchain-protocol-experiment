@@ -1,4 +1,7 @@
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::{
+    primitives::{Address, B256, Bytes, U256},
+    sol_types::{Panic, Revert, SolError},
+};
 use jsonrpsee::{
     core::RpcResult,
     types::{ErrorObjectOwned, Params, error::ErrorCode},
@@ -321,14 +324,29 @@ pub fn get_logs_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<V
 /// client can decode the contract's reason.
 const EXECUTION_REVERTED: i32 = 3;
 
+/// The human-readable reason inside revert data, if it is in one of Solidity's
+/// two standard shapes: `Error(string)`, from `revert("…")` and
+/// `require(cond, "…")`, or `Panic(uint256)`, from a failed `assert` or an
+/// arithmetic overflow.
+fn revert_reason(output: &[u8]) -> Option<String> {
+    if let Ok(revert) = Revert::abi_decode(output) {
+        return Some(revert.reason);
+    }
+    Panic::abi_decode(output).ok().map(|panic| panic.to_string())
+}
+
 /// Turns a call that ran but failed into the error a client expects.
+///
+/// A revert's reason goes into the message as well as the data, the way geth
+/// reports it: tools like cast show the message, so this is what makes
+/// `require(…, "reason")` visible to whoever is calling.
 fn execution_failed(outcome: &TxOutcome) -> ErrorObjectOwned {
     if outcome.reverted() {
-        ErrorObjectOwned::owned(
-            EXECUTION_REVERTED,
-            "execution reverted",
-            Some(data_bytes(&outcome.output)),
-        )
+        let message = match revert_reason(&outcome.output) {
+            Some(reason) => format!("execution reverted: {reason}"),
+            None => "execution reverted".to_owned(),
+        };
+        ErrorObjectOwned::owned(EXECUTION_REVERTED, message, Some(data_bytes(&outcome.output)))
     } else {
         invalid_input(format!(
             "execution halted: {}",
@@ -426,5 +444,50 @@ pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResu
         Ok(gas) => Ok(quantity(gas)),
         Err(EstimateError::Invalid(error)) => Err(invalid_input(error)),
         Err(EstimateError::Failed(outcome)) => Err(execution_failed(&outcome)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reverted_with(output: Bytes) -> TxOutcome {
+        TxOutcome {
+            success: false,
+            gas_used: 0,
+            created_address: None,
+            logs: Vec::new(),
+            output,
+            halt_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_solidity_revert_reason_is_put_in_the_message() {
+        // What `revert("Counter: nope")` returns.
+        let data = Bytes::from(Revert::from("Counter: nope").abi_encode());
+        let error = execution_failed(&reverted_with(data.clone()));
+
+        assert_eq!(error.code(), EXECUTION_REVERTED);
+        assert_eq!(error.message(), "execution reverted: Counter: nope");
+        // The raw data is still attached for clients that decode it themselves.
+        assert_eq!(
+            error.data().map(|d| d.get().to_owned()),
+            Some(format!("\"{}\"", data_bytes(&data)))
+        );
+    }
+
+    #[test]
+    fn a_panic_is_described_and_unknown_data_is_left_raw() {
+        // What `assert(false)` returns: Panic(0x01).
+        let panic = Bytes::from(Panic::from(1u64).abi_encode());
+        let message = execution_failed(&reverted_with(panic)).message().to_owned();
+        assert!(message.starts_with("execution reverted: panic: assert"), "got: {message}");
+
+        // `REVERT(0, 0)` and custom errors carry nothing we can read.
+        let bare = execution_failed(&reverted_with(Bytes::new()));
+        assert_eq!(bare.message(), "execution reverted");
+        let custom = execution_failed(&reverted_with(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])));
+        assert_eq!(custom.message(), "execution reverted");
     }
 }
