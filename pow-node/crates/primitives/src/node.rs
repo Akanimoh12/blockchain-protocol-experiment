@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::primitives::{Address, B256, Bloom, Bytes, U256, keccak256};
 use alloy_rlp::{Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,9 @@ pub struct Block {
     pub state_root: B256,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    /// Bloom filter over every log in the block, so a client can skip blocks
+    /// that cannot contain the event it is looking for.
+    pub logs_bloom: Bloom,
     /// Number of leading zero bits `hash` must have for this block to be valid.
     pub difficulty: u8,
     /// Sum of every ancestor's difficulty plus this block's. The heaviest chain
@@ -86,6 +89,9 @@ pub struct BlockHeader {
     pub state_root: B256,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    /// Hashed like the rest of the header, as on Ethereum: a miner cannot
+    /// advertise logs its block does not contain.
+    pub logs_bloom: Bloom,
     pub difficulty: u8,
     pub timestamp: u64,
     pub gas_limit: u64,
@@ -410,6 +416,7 @@ impl Block {
             state_root: self.state_root,
             transaction_root: self.transaction_root,
             receipts_root: self.receipts_root,
+            logs_bloom: self.logs_bloom,
             difficulty: self.difficulty,
             timestamp: self.timestamp,
             gas_limit: self.gas_limit,
@@ -471,21 +478,66 @@ pub fn retarget_difficulty(current: u8, actual_ms: u64, target_ms: u64) -> u8 {
     next.clamp(MIN_DIFFICULTY_LEADING_ZEROS, MAX_DIFFICULTY_LEADING_ZEROS)
 }
 
-/// Commits to a whole account set in a single hash.
+/// Commits to the whole world — every account's balance and nonce, its code and
+/// its storage — in a single hash.
 ///
-/// Addresses are sorted first so that two nodes holding the same accounts always
+/// Code is covered through `code_hash`. Storage is covered through each
+/// account's storage root, which is recomputed here from the slots themselves
+/// rather than read from the cached `storage_root` field: a write that forgot to
+/// refresh the cache must not be able to produce a root that hides it. Without
+/// this, two chains with different contract state could share a state root,
+/// which would make the root worthless.
+///
+/// Addresses are sorted first so that two nodes holding the same state always
 /// produce the same root, regardless of `HashMap` iteration order. Ethereum gets
 /// that ordering for free from its trie.
-pub fn state_root_of(accounts: &HashMap<Address, Account>) -> B256 {
-    let mut entries: Vec<(&Address, &Account)> = accounts.iter().collect();
+pub fn state_root_of(world: &WorldState) -> B256 {
+    let mut entries: Vec<(&Address, &Account)> = world.accounts.iter().collect();
     entries.sort_by_key(|(address, _)| **address);
 
     let mut buf = Vec::new();
     for (address, account) in entries {
+        let committed = Account {
+            storage_root: world
+                .storage
+                .get(address)
+                .map(storage_root_of)
+                .unwrap_or(B256::ZERO),
+            ..account.clone()
+        };
         buf.extend_from_slice(address.as_slice());
-        account.encode(&mut buf);
+        committed.encode(&mut buf);
     }
     keccak256(buf)
+}
+
+/// The 2048-bit bloom filter over a set of logs, as receipts and block headers
+/// carry it.
+///
+/// A bloom filter answers "might these logs mention X?" without reading them:
+/// a client scanning for an event can skip every block whose bloom says no.
+/// Each log's address and every topic is hashed, and three 11-bit slices of the
+/// hash each switch on one bit. If any of X's three bits is off, X is definitely
+/// absent; if all are on, it is *probably* present (Yellow Paper §4.3.1, `M3:2048`).
+pub fn logs_bloom<'a>(logs: impl IntoIterator<Item = &'a Log>) -> Bloom {
+    let mut bloom = [0u8; 256];
+    for log in logs {
+        accrue_bloom(&mut bloom, log.address.as_slice());
+        for topic in &log.topics {
+            accrue_bloom(&mut bloom, topic.as_slice());
+        }
+    }
+    Bloom::from(bloom)
+}
+
+/// Sets the three bits `input` maps to. Bit 0 is the lowest bit of the *last*
+/// byte, because the filter is one big-endian 2048-bit number.
+fn accrue_bloom(bloom: &mut [u8; 256], input: &[u8]) {
+    let hash = keccak256(input);
+    for i in [0, 2, 4] {
+        let bit = ((usize::from(hash[i]) << 8) | usize::from(hash[i + 1])) & 2047;
+        bloom[255 - bit / 8] |= 1 << (bit % 8);
+    }
 }
 
 /// Hashes an ordered list of hashes into a single root.
@@ -524,9 +576,10 @@ impl BlockState {
         let header = BlockHeader {
             number: 0,
             parent_hash: B256::ZERO,
-            state_root: state_root_of(&state.world.accounts),
+            state_root: state_root_of(&state.world),
             transaction_root: B256::ZERO,
             receipts_root: B256::ZERO,
+            logs_bloom: Bloom::ZERO,
             difficulty,
             timestamp: 0,
             gas_limit: BLOCK_GAS_LIMIT,
@@ -544,6 +597,7 @@ impl BlockState {
             state_root: header.state_root,
             transaction_root: header.transaction_root,
             receipts_root: header.receipts_root,
+            logs_bloom: header.logs_bloom,
             difficulty: header.difficulty,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
@@ -660,7 +714,7 @@ impl BlockState {
 
     /// Commits to the account set at the chain head in a single hash.
     pub fn state_root(&self) -> B256 {
-        state_root_of(&self.world.accounts)
+        state_root_of(&self.world)
     }
 
     /// A copy of the world state at the head, for the miner (and later the EVM)
@@ -685,14 +739,19 @@ impl BlockState {
         self.mempool.iter().any(|tx| &tx.hash == hash)
     }
 
-    /// The transactions the next block would include: as many as fit in one
-    /// block's gas limit, oldest first.
+    /// Every pending transaction, oldest first: the candidates for the next
+    /// block.
+    ///
+    /// This used to stop at `BLOCK_GAS_LIMIT / TRANSFER_GAS` = 149, which was
+    /// right only while every transaction cost exactly 21,000 gas. How many
+    /// actually fit now depends on how much gas each one *uses*, which is only
+    /// known by executing it — so the executor decides, filling the block until
+    /// the next transaction would not fit.
     ///
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
     pub fn peek_mempool_batch(&self) -> Vec<PendingTransaction> {
-        let max_txs = (BLOCK_GAS_LIMIT / TRANSFER_GAS) as usize;
-        self.mempool.iter().take(max_txs).cloned().collect()
+        self.mempool.clone()
     }
 
     // block production
@@ -812,12 +871,85 @@ mod tests {
         two.insert(b, Account::new(U256::from(2u64)));
         two.insert(a, Account::new(U256::from(1u64)));
 
-        assert_eq!(state_root_of(&one), state_root_of(&two));
+        // `state_root_of` takes the whole world now, so that code and storage are
+        // committed to as well; these accounts simply have neither.
+        let root = |accounts: &HashMap<Address, Account>| {
+            state_root_of(&WorldState::from_accounts(accounts.clone()))
+        };
+        assert_eq!(root(&one), root(&two));
 
         // Changing a single balance must change the root.
         let mut three = one.clone();
         three.insert(a, Account::new(U256::from(99u64)));
-        assert_ne!(state_root_of(&one), state_root_of(&three));
+        assert_ne!(root(&one), root(&three));
+    }
+
+    #[test]
+    fn states_differing_in_one_storage_slot_have_different_roots() {
+        let contract = Address::repeat_byte(0xc0);
+        let mut one = WorldState::default();
+        one.set_code(contract, Bytes::from_static(&[0x00]));
+        one.set_storage(contract, U256::ZERO, U256::from(42u64));
+        one.refresh_storage_root(contract);
+
+        let mut two = one.clone();
+        two.set_storage(contract, U256::ZERO, U256::from(43u64));
+        two.refresh_storage_root(contract);
+        assert_ne!(state_root_of(&one), state_root_of(&two));
+
+        // Even a write whose cached `storage_root` was never refreshed changes
+        // the root, because the root is computed from the slots themselves.
+        let mut stale = one.clone();
+        stale.set_storage(contract, U256::from(1u64), U256::from(1u64));
+        assert_eq!(
+            stale.account(&contract).storage_root,
+            one.account(&contract).storage_root
+        );
+        assert_ne!(state_root_of(&one), state_root_of(&stale));
+    }
+
+    #[test]
+    fn states_differing_only_in_code_have_different_roots() {
+        let contract = Address::repeat_byte(0xc0);
+        let mut one = WorldState::default();
+        one.set_code(contract, Bytes::from_static(&[0x00]));
+        let mut two = WorldState::default();
+        two.set_code(contract, Bytes::from_static(&[0xfe]));
+        assert_ne!(state_root_of(&one), state_root_of(&two));
+    }
+
+    #[test]
+    fn the_logs_bloom_matches_alloys_and_finds_what_was_logged() {
+        let emitter = Address::repeat_byte(0xc0);
+        let topic = B256::repeat_byte(0x7e);
+        let logs = [
+            Log {
+                address: emitter,
+                topics: vec![topic],
+                ..Default::default()
+            },
+            Log {
+                address: Address::repeat_byte(0xc1),
+                ..Default::default()
+            },
+        ];
+
+        let bloom = logs_bloom(&logs);
+        assert_ne!(bloom, Bloom::ZERO);
+
+        // The same algorithm as alloy's reference implementation, bit for bit.
+        let mut reference = Bloom::ZERO;
+        for log in &logs {
+            reference.accrue_raw_log(log.address, &log.topics);
+        }
+        assert_eq!(bloom, reference);
+
+        // Everything logged is reported as possibly present.
+        assert!(bloom.contains_input(alloy::primitives::BloomInput::Raw(emitter.as_slice())));
+        assert!(bloom.contains_input(alloy::primitives::BloomInput::Raw(topic.as_slice())));
+
+        // No logs, no bits.
+        assert_eq!(logs_bloom(&[]), Bloom::ZERO);
     }
 
     #[test]

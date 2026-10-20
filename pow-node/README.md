@@ -158,16 +158,18 @@ Anything else returns `-32601 Method not found`.
 
 ## Chain parameters
 
-Deliberately Frontier-era, in `crates/primitives/src/constants.rs`:
+Deliberately Frontier-era consensus, in `crates/primitives/src/constants.rs`,
+with Shanghai-era execution so that modern Solidity runs:
 
 | Parameter | Value | Note |
 | --- | --- | --- |
 | Chain ID | 1 | |
-| Gas price | 1 gwei, fixed | No fee market; no EIP-1559 |
-| Transfer cost | 21,000 gas | The only cost there is |
-| Block gas limit | 3,141,592 | Frontier's "pi million" — 149 transfers per block |
+| Gas price | 1 gwei, fixed | No fee market, no EIP-1559: the basefee is 0 and nothing is burned |
+| Transfer cost | 21,000 gas | Contract calls and deployments cost whatever the EVM measures |
+| Block gas limit | 3,141,592 | Frontier's "pi million"; blocks fill by gas actually used |
 | Block reward | 5 ETH | As on Frontier and Homestead |
 | Target block time | 15s (2s with `--dev`) | |
+| EVM rules | Shanghai (REVM) | Compile Solidity with `--evm-version shanghai` |
 
 
 ## Course documents

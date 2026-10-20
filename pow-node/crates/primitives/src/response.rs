@@ -2,13 +2,13 @@ use std::fmt::LowerHex;
 
 use alloy::{
     consensus::EMPTY_OMMER_ROOT_HASH,
-    primitives::{Address, B256, Bytes},
+    primitives::{Address, B256, Bloom, Bytes},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     constants::EXTRA_DATA,
-    node::{Block, Log, Transaction, TransactionReceipt},
+    node::{Block, Log, Transaction, TransactionReceipt, logs_bloom},
 };
 
 /// Encodes a number as an Ethereum *quantity*: minimal hex, `0x0` for zero.
@@ -33,6 +33,11 @@ pub fn data_address(address: &Address) -> String {
 /// Encodes a 32-byte hash as lowercase hex.
 pub fn data_hash(hash: &B256) -> String {
     format!("{hash:#x}")
+}
+
+/// Encodes a 2048-bit logs bloom as 256 bytes of lowercase hex.
+pub fn data_bloom(bloom: &Bloom) -> String {
+    format!("0x{}", alloy::hex::encode(bloom))
 }
 
 /// Encodes a byte string as lowercase hex, `0x` when empty.
@@ -72,7 +77,7 @@ pub struct BlockResponse {
     pub uncles: Vec<String>,
     /// Zero: Breeja's proof of work is a plain keccak search with no Ethash mix.
     pub mix_hash: String,
-    /// Still 256 zero bytes: a block-level bloom filter is milestone 6.
+    /// Bloom filter over every log in the block.
     pub logs_bloom: String,
 }
 
@@ -168,7 +173,7 @@ impl BlockResponse {
             sha3_uncles: data_hash(&EMPTY_OMMER_ROOT_HASH),
             uncles: Vec::new(),
             mix_hash: data_hash(&B256::ZERO),
-            logs_bloom: format!("0x{}", "00".repeat(256)),
+            logs_bloom: data_bloom(&block.logs_bloom),
         }
     }
 }
@@ -210,9 +215,7 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
             effective_gas_price: quantity(receipt.effective_gas_price),
             contract_address: receipt.contract_address.as_ref().map(data_address),
             logs: receipt.logs.iter().map(LogResponse::from).collect(),
-            // Still 256 zero bytes, even when there are logs: the real bloom
-            // filter is milestone 6.
-            logs_bloom: format!("0x{}", "00".repeat(256)),
+            logs_bloom: data_bloom(&logs_bloom(&receipt.logs)),
             status: quantity(receipt.status),
             tx_type: "0x0".to_owned(),
         }

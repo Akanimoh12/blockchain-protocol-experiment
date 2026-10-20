@@ -685,9 +685,21 @@ async fn standard_clients_can_parse_blocks_transactions_receipts_and_logs() {
     )
     .await;
 
+    // Real blooms: empty for the deployment, which logged nothing, and set for
+    // the call, which logged from the contract's address.
+    let empty_bloom = format!("0x{}", "00".repeat(256));
+    assert_eq!(deployed["logsBloom"], empty_bloom);
+    assert_ne!(called["logsBloom"], empty_bloom);
+
     for receipt in [&deployed, &called] {
         let parsed: alloy::rpc::types::TransactionReceipt = parse_as("receipt", receipt);
         assert!(parsed.status());
+        // alloy reads the same bloom back and agrees with the logs beside it.
+        for log in parsed.inner.logs() {
+            assert!(parsed.inner.logs_bloom().contains_input(
+                alloy::primitives::BloomInput::Raw(log.address().as_slice())
+            ));
+        }
 
         let tx: Value = harness
             .client

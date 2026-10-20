@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, Bloom};
 use primitives::{
-    constants::BLOCK_REWARD,
+    constants::{BLOCK_GAS_LIMIT, BLOCK_REWARD},
     node::{
         Account, Log, PendingTransaction, Transaction, TransactionReceipt, WorldState,
-        hash_list_root,
+        hash_list_root, logs_bloom, state_root_of,
     },
 };
 
@@ -20,6 +20,8 @@ pub struct Execution {
     pub gas_used: u64,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    /// Bloom over every log the block's transactions emitted.
+    pub logs_bloom: Bloom,
     pub state_root: B256,
 }
 
@@ -67,6 +69,19 @@ pub fn execute_block(
     let mut log_count = 0u64;
 
     for tx in batch {
+        // A transaction may use up to its whole gas limit, and how much it
+        // actually uses is unknown until it runs, so its *limit* has to fit in
+        // what the block has left — Ethereum's rule. The block fills by gas used,
+        // so once the cheap transactions are in, a costly one can still find
+        // room that a count-based limit would have wasted.
+        //
+        // Stopping here, rather than skipping ahead to smaller transactions,
+        // keeps the mempool first-come first-served and keeps each sender's
+        // transactions in nonce order. Everything left waits for the next block.
+        if tx.gas > BLOCK_GAS_LIMIT - gas_used {
+            break;
+        }
+
         let outcome = match execute_transaction(&mut db, block, tx) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -148,7 +163,8 @@ pub fn execute_block(
     Execution {
         transaction_root: hash_list_root(&tx_hashes),
         receipts_root: hash_list_root(&receipt_hashes),
-        state_root: primitives::node::state_root_of(&world.accounts),
+        logs_bloom: logs_bloom(receipts.iter().flat_map(|receipt| &receipt.logs)),
+        state_root: state_root_of(&world),
         world,
         transactions,
         receipts,
@@ -159,7 +175,9 @@ pub fn execute_block(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::U256;
-    use primitives::constants::{CHAIN_ID, DEV_ADDRESS, DEV_ADDRESS_1, GAS_PRICE, TRANSFER_GAS};
+    use primitives::constants::{
+        BLOCK_GAS_LIMIT, CHAIN_ID, DEV_ADDRESS, DEV_ADDRESS_1, GAS_PRICE, TRANSFER_GAS,
+    };
 
     use super::*;
     use crate::evm::{InvalidTransaction, TxOutcome};
@@ -317,6 +335,61 @@ mod tests {
         assert_eq!(execution.gas_used, 0);
         assert_eq!(execution.transaction_root, B256::ZERO);
         assert_eq!(execution.world.accounts[&miner()].balance, BLOCK_REWARD);
+    }
+
+    /// A call from the dev account with an explicit gas limit.
+    fn call(to: Address, nonce: u64, gas: u64) -> PendingTransaction {
+        PendingTransaction {
+            hash: B256::with_last_byte(nonce as u8),
+            to: Some(to),
+            gas,
+            value: U256::ZERO,
+            ..transfer(U256::ZERO, nonce)
+        }
+    }
+
+    #[test]
+    fn a_block_fills_by_gas_used_and_never_exceeds_the_limit() {
+        // LOOPER's runtime: `JUMPDEST PUSH1 0 JUMP`, an infinite loop. Every call
+        // runs out of gas, which burns its entire limit — the most expensive
+        // thing a transaction can be.
+        let looper = Address::repeat_byte(0x10);
+        let mut world = funded(one_eth() * U256::from(10u64));
+        world.set_code(looper, alloy::primitives::bytes!("5b600056"));
+
+        // One cheap transfer, then four 1,000,000-gas calls: 4,021,000 gas of
+        // work offered against a 3,141,592 limit.
+        let mut batch = vec![transfer(one_eth(), 0)];
+        batch.extend((1..=4).map(|nonce| call(looper, nonce, 1_000_000)));
+
+        let execution = execute_block(world, HashMap::new(), &batch, &block());
+
+        // The transfer and three calls fit (3,021,000); the fourth would not.
+        assert_eq!(execution.transactions.len(), 4);
+        assert_eq!(execution.gas_used, 21_000 + 3 * 1_000_000);
+        assert!(execution.gas_used <= BLOCK_GAS_LIMIT);
+        // Out-of-gas calls are mined as failures that paid for every unit.
+        for receipt in &execution.receipts[1..] {
+            assert_eq!(receipt.status, 0);
+            assert_eq!(receipt.gas_used, 1_000_000);
+        }
+        // The fourth call was not dropped, just not reached: it is still valid
+        // for the next block, and its nonce was never used.
+        assert_eq!(execution.world.account(&DEV_ADDRESS).nonce, 4);
+    }
+
+    #[test]
+    fn a_zero_value_transfer_to_a_fresh_address_leaves_no_empty_account() {
+        // REVM touches the recipient even when nothing is sent. Since EIP-161 a
+        // touched account that ends up empty is deleted, so the state — and the
+        // state root — look exactly as if the address had never been mentioned.
+        let fresh = Address::repeat_byte(0x5e);
+        let mut tx = transfer(U256::ZERO, 0);
+        tx.to = Some(fresh);
+
+        let (outcome, world) = run(funded(one_eth()), &tx);
+        assert!(outcome.unwrap().success);
+        assert!(!world.accounts.contains_key(&fresh));
     }
 
     #[test]

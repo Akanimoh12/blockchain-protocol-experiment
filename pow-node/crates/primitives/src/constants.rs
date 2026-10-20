@@ -31,12 +31,13 @@ pub const MAX_DIFFICULTY_LEADING_ZEROS: u8 = 32;
 /// rather than a per-block base fee.
 pub const GAS_PRICE: u128 = 1_000_000_000;
 
-/// Intrinsic cost of a plain ETH transfer. Without an EVM this is the cost of
-/// *every* transaction Breeja accepts.
+/// Intrinsic cost of a plain ETH transfer, and the base every transaction pays
+/// before calldata and code are charged on top (see `node::intrinsic_gas`).
 pub const TRANSFER_GAS: u64 = 21_000;
 
-/// Frontier's famous "pi million" block gas limit, which caps a block at
-/// `3_141_592 / 21_000 = 149` transfers.
+/// Frontier's famous "pi million" block gas limit. Blocks are filled by the gas
+/// their transactions actually use: up to 149 plain transfers, or three
+/// million-gas contract calls, or any mix in between.
 pub const BLOCK_GAS_LIMIT: u64 = 3_141_592;
 
 /// Reward paid to the miner for sealing a block, on top of the transaction fees

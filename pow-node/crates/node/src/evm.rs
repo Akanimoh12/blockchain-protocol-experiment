@@ -411,6 +411,16 @@ impl DatabaseCommit for BreejaDb {
                 continue;
             }
 
+            // EIP-161: an account that was touched and is left empty — no
+            // balance, no nonce, no code — is deleted, not stored. Without this,
+            // sending 0 ETH to a fresh address would add an empty account to the
+            // state root that Ethereum would never have. A *newly created*
+            // account is kept even if empty, exactly as REVM's own `State` does.
+            if !account.is_created() && account.is_empty() {
+                self.world.remove_account(&address);
+                continue;
+            }
+
             // A freshly created contract starts with empty storage, even if the
             // address once held a contract that self-destructed. REVM's own
             // `CacheDB` clears here for the same reason.
