@@ -14,15 +14,19 @@
 
 use std::{collections::HashMap, convert::Infallible};
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, CHAIN_ID},
     node::{PendingTransaction, WorldState},
 };
 use revm::{
-    Context, Database, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
+    Context, Database, DatabaseCommit, DatabaseRef, ExecuteEvm, MainBuilder, MainContext,
     bytecode::Bytecode,
-    context::{BlockEnv, CfgEnv, TxEnv, result::EVMError},
+    context::{
+        BlockEnv, CfgEnv, TxEnv,
+        result::{EVMError, ExecutionResult},
+    },
+    database_interface::WrapDatabaseRef,
     primitives::{AddressMap, KECCAK_EMPTY, StorageKey, StorageValue, TxKind, hardfork::SpecId},
     state::{Account as EvmAccount, AccountInfo},
 };
@@ -63,6 +67,34 @@ pub struct TxOutcome {
     /// Events the code emitted. Always empty for a failed transaction: a revert
     /// undoes its logs along with everything else.
     pub logs: Vec<revm::primitives::Log>,
+    /// What the code returned: a call's return data, a deployment's runtime
+    /// code, or a revert's reason.
+    pub output: Bytes,
+    /// Why execution halted — out of gas, an invalid opcode — if it did. `None`
+    /// for both success and an explicit `REVERT`.
+    pub halt_reason: Option<String>,
+}
+
+impl TxOutcome {
+    /// `true` for an explicit `REVERT`, as opposed to a halt. Only a revert
+    /// carries a reason the caller chose to return.
+    pub fn reverted(&self) -> bool {
+        !self.success && self.halt_reason.is_none()
+    }
+}
+
+fn summarize(result: &ExecutionResult) -> TxOutcome {
+    TxOutcome {
+        success: result.is_success(),
+        gas_used: result.tx_gas_used(),
+        created_address: result.created_address(),
+        logs: result.logs().to_vec(),
+        output: result.output().cloned().unwrap_or_default(),
+        halt_reason: match result {
+            ExecutionResult::Halt { reason, .. } => Some(format!("{reason:?}")),
+            _ => None,
+        },
+    }
 }
 
 impl BlockContext {
@@ -126,12 +158,7 @@ pub fn execute_transaction(
         .build_mainnet();
 
     let outcome = evm.transact(tx_env(tx))?;
-    let summary = TxOutcome {
-        success: outcome.result.is_success(),
-        gas_used: outcome.result.tx_gas_used(),
-        created_address: outcome.result.created_address(),
-        logs: outcome.result.logs().to_vec(),
-    };
+    let summary = summarize(&outcome.result);
 
     // The EVM holds `db` mutably for as long as it lives, so it has to go
     // before the changes can be written back.
@@ -139,6 +166,119 @@ pub fn execute_transaction(
     db.commit(outcome.state);
 
     Ok(summary)
+}
+
+/// A transaction-shaped question for the EVM that is never mined: what
+/// `eth_call` and `eth_estimateGas` ask.
+#[derive(Debug, Clone, Default)]
+pub struct SimulatedCall {
+    pub from: Address,
+    /// `None` simulates a deployment.
+    pub to: Option<Address>,
+    pub value: U256,
+    pub data: Bytes,
+    /// Zero unless the caller names a price. With a zero price the gas costs
+    /// nothing, so the balance check only has to cover `value`.
+    pub gas_price: u128,
+    /// Whether `from` must be able to afford the call. `eth_call` turns this off
+    /// — reading a contract should not need funds — while `eth_estimateGas`
+    /// keeps it on, because an estimate for a transaction the sender cannot pay
+    /// for describes a transaction that can never be sent.
+    pub check_balance: bool,
+}
+
+/// Executes `call` against `db` and throws every state change away.
+///
+/// That discard is the *only* difference from a mined transaction. REVM keeps
+/// its writes in a journal; reading through `WrapDatabaseRef` means nothing ever
+/// reaches `db`, so the same snapshot can be simulated against again and again.
+///
+/// The nonce check is always off: a call request carries no nonce, and asking
+/// the caller to supply the right one would add nothing to the answer.
+pub fn simulate(
+    db: &BreejaDb,
+    block: &BlockContext,
+    call: &SimulatedCall,
+    gas_limit: u64,
+) -> Result<TxOutcome, InvalidTransaction> {
+    let mut cfg = cfg_env();
+    cfg.disable_nonce_check = true;
+    cfg.disable_balance_check = !call.check_balance;
+
+    let tx = TxEnv {
+        tx_type: 0,
+        caller: call.from,
+        gas_limit,
+        gas_price: call.gas_price,
+        kind: call.to.map_or(TxKind::Create, TxKind::Call),
+        value: call.value,
+        data: call.data.clone(),
+        chain_id: Some(CHAIN_ID),
+        ..Default::default()
+    };
+
+    let mut evm = Context::mainnet()
+        .with_db(WrapDatabaseRef(db))
+        .with_block(block.block_env())
+        .with_cfg(cfg)
+        .build_mainnet();
+
+    // `state` is dropped without being committed.
+    Ok(summarize(&evm.transact(tx)?.result))
+}
+
+/// Why a gas estimate could not be produced.
+#[derive(Debug)]
+pub enum EstimateError {
+    /// REVM refused the call outright, for example because `from` cannot
+    /// afford `value`.
+    Invalid(InvalidTransaction),
+    /// The call fails even with all the gas it was allowed. More gas would not
+    /// help, so there is no amount to estimate.
+    Failed(TxOutcome),
+}
+
+/// Finds the smallest gas limit at which `call` succeeds, searching up to `cap`.
+///
+/// The cost of running code is only known by running it, and running it with
+/// too little gas fails — so this is a search. One run at the cap proves that
+/// *some* limit works and reports the gas it used. No smaller limit can work,
+/// so that is the floor; most calls succeed right at it and the search ends
+/// there. When they do not — a refund made the reported figure smaller than
+/// what the call needed while it ran, or the 63/64 rule held gas back from a
+/// sub-call — a binary search finds the true minimum. Every candidate it returns
+/// has actually succeeded.
+///
+/// This is a heuristic, not a proof: a contract can read its remaining gas with
+/// the `GAS` opcode and behave differently on each probe.
+pub fn estimate_gas(
+    db: &BreejaDb,
+    block: &BlockContext,
+    call: &SimulatedCall,
+    cap: u64,
+) -> Result<u64, EstimateError> {
+    let succeeds = |gas: u64| simulate(db, block, call, gas).is_ok_and(|outcome| outcome.success);
+
+    let at_cap = simulate(db, block, call, cap).map_err(EstimateError::Invalid)?;
+    if !at_cap.success {
+        return Err(EstimateError::Failed(at_cap));
+    }
+
+    if succeeds(at_cap.gas_used) {
+        return Ok(at_cap.gas_used);
+    }
+
+    // `lo` always fails and `hi` always succeeds.
+    let (mut lo, mut hi) = (at_cap.gas_used, cap);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if succeeds(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Ok(hi)
 }
 
 /// A snapshot of chain state that REVM can read from and write back to.
@@ -173,7 +313,13 @@ fn evm_code_hash(code_hash: B256) -> B256 {
     }
 }
 
-impl Database for BreejaDb {
+/// Read-only access, which is all a simulation needs.
+///
+/// `eth_call` and `eth_estimateGas` run REVM against `&BreejaDb` through
+/// `WrapDatabaseRef`: REVM keeps its writes in its own journal, nothing is ever
+/// committed, and one snapshot can serve every probe of a gas estimate without
+/// being copied again.
+impl DatabaseRef for BreejaDb {
     // Reading from an in-memory map cannot fail. A database backed by disk would
     // use a real error type here.
     type Error = Infallible;
@@ -182,7 +328,7 @@ impl Database for BreejaDb {
     /// not as an empty account. The distinction is real in the EVM: for example,
     /// a `CALL` that sends value to a non-existent account pays an extra 25,000
     /// gas to create it.
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let Some(account) = self.world.accounts.get(&address) else {
             return Ok(None);
         };
@@ -205,7 +351,7 @@ impl Database for BreejaDb {
         }))
     }
 
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         // Unknown hashes read as empty code. A disk-backed node would treat a
         // miss as corruption, but `Infallible` leaves no way to say so — and
         // `basic` always supplies the code up front, so this is a fallback.
@@ -218,16 +364,34 @@ impl Database for BreejaDb {
             .unwrap_or_default())
     }
 
-    fn storage(
-        &mut self,
-        address: Address,
-        index: StorageKey,
-    ) -> Result<StorageValue, Self::Error> {
+    fn storage_ref(&self, address: Address, index: StorageKey) -> Result<StorageValue, Self::Error> {
         Ok(self.world.storage_at(&address, index))
     }
 
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         Ok(self.block_hashes.get(&number).copied().unwrap_or_default())
+    }
+}
+
+/// Mutable access, which mined transactions need so their changes can be
+/// committed. Reading is the same either way.
+impl Database for BreejaDb {
+    type Error = Infallible;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.basic_ref(address)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.code_by_hash_ref(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, index: StorageKey) -> Result<StorageValue, Self::Error> {
+        self.storage_ref(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.block_hash_ref(number)
     }
 }
 
@@ -297,6 +461,121 @@ mod tests {
     const STORE42_RUNTIME: [u8; 11] = [
         0x60, 0x2a, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
     ];
+
+    const RETURN42_RUNTIME: [u8; 10] = [0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+    const REVERTER_RUNTIME: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
+
+    fn sim_block() -> BlockContext {
+        BlockContext {
+            number: 1,
+            timestamp: 1,
+            miner: Address::repeat_byte(0x99),
+            difficulty: 1,
+            parent_hash: B256::repeat_byte(0x01),
+        }
+    }
+
+    /// A funded caller plus three contracts, installed directly rather than
+    /// deployed, so each test starts from known code.
+    fn world_with_contracts() -> (BreejaDb, Address) {
+        let caller = Address::repeat_byte(0x11);
+        let mut db = db_with(caller, Account::new(one_eth()));
+        for (byte, code) in [
+            (0xa1, &STORE42_RUNTIME[..]),
+            (0xa2, &RETURN42_RUNTIME[..]),
+            (0xa3, &REVERTER_RUNTIME[..]),
+        ] {
+            db.world
+                .set_code(Address::repeat_byte(byte), Bytes::copy_from_slice(code));
+        }
+        (db, caller)
+    }
+
+    fn call_to(from: Address, to: Address) -> SimulatedCall {
+        SimulatedCall {
+            from,
+            to: Some(to),
+            check_balance: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_simulation_returns_the_output_and_changes_nothing() {
+        let (db, caller) = world_with_contracts();
+        let before = db.world.clone();
+
+        let answer = simulate(
+            &db,
+            &sim_block(),
+            &call_to(caller, Address::repeat_byte(0xa2)),
+            BLOCK_GAS_LIMIT,
+        )
+        .unwrap();
+        assert!(answer.success);
+        assert_eq!(answer.output, Bytes::from(U256::from(42u64).to_be_bytes_vec()));
+
+        // STORE42 *would* write slot 0 and emit a log...
+        let store = simulate(
+            &db,
+            &sim_block(),
+            &call_to(caller, Address::repeat_byte(0xa1)),
+            BLOCK_GAS_LIMIT,
+        )
+        .unwrap();
+        assert!(store.success);
+        assert_eq!(store.logs.len(), 1);
+        // ...but a simulation keeps none of it: not the slot, not the caller's
+        // nonce, not the fee.
+        assert_eq!(db.world, before);
+    }
+
+    #[test]
+    fn eth_call_needs_no_funds_but_an_estimate_does() {
+        let (db, _) = world_with_contracts();
+        let pauper = Address::repeat_byte(0x77);
+        let mut call = call_to(pauper, Address::repeat_byte(0x22));
+        call.value = U256::from(1u64);
+
+        call.check_balance = false;
+        assert!(simulate(&db, &sim_block(), &call, BLOCK_GAS_LIMIT).unwrap().success);
+
+        call.check_balance = true;
+        assert!(simulate(&db, &sim_block(), &call, BLOCK_GAS_LIMIT).is_err());
+    }
+
+    #[test]
+    fn a_transfer_is_estimated_at_exactly_21000() {
+        let (db, caller) = world_with_contracts();
+        let mut call = call_to(caller, Address::repeat_byte(0x22));
+        call.value = one_eth() / U256::from(2u64);
+
+        let gas = estimate_gas(&db, &sim_block(), &call, BLOCK_GAS_LIMIT).unwrap();
+        assert_eq!(gas, 21_000);
+    }
+
+    #[test]
+    fn an_estimate_is_enough_and_one_less_is_not() {
+        let (db, caller) = world_with_contracts();
+        let call = call_to(caller, Address::repeat_byte(0xa1));
+
+        let gas = estimate_gas(&db, &sim_block(), &call, BLOCK_GAS_LIMIT).unwrap();
+        assert!(simulate(&db, &sim_block(), &call, gas).unwrap().success);
+        let short = simulate(&db, &sim_block(), &call, gas - 1).unwrap();
+        assert!(!short.success, "the estimate should be the minimum");
+        assert!(short.halt_reason.is_some(), "too little gas halts, it does not revert");
+    }
+
+    #[test]
+    fn a_call_that_always_reverts_cannot_be_estimated() {
+        let (db, caller) = world_with_contracts();
+        let call = call_to(caller, Address::repeat_byte(0xa3));
+
+        match estimate_gas(&db, &sim_block(), &call, BLOCK_GAS_LIMIT) {
+            Err(EstimateError::Failed(outcome)) => assert!(outcome.reverted()),
+            other => panic!("expected a revert at the cap, got {other:?}"),
+        }
+    }
 
     #[test]
     fn basic_returns_balance_and_nonce_for_a_funded_account() {

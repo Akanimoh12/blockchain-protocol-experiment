@@ -619,14 +619,21 @@ impl BlockState {
             .map(|snapshot| snapshot.storage_at(address, slot))
     }
 
-    /// Hashes of the most recent 256 blocks by number — the window the
-    /// `BLOCKHASH` opcode can see.
-    pub fn recent_block_hashes(&self) -> HashMap<u64, B256> {
-        let start = self.blocks.len().saturating_sub(256);
-        self.blocks[start..]
+    /// Hashes of the 256 blocks up to and including `number` — the window the
+    /// `BLOCKHASH` opcode can see from the block after it.
+    pub fn recent_block_hashes(&self, number: u64) -> HashMap<u64, B256> {
+        let end = (number as usize + 1).min(self.blocks.len());
+        let start = end.saturating_sub(256);
+        self.blocks[start..end]
             .iter()
             .map(|block| (block.number, block.hash))
             .collect()
+    }
+
+    /// A copy of the whole world as it was after block `number`, for simulating
+    /// against historical state. `None` if that block does not exist.
+    pub fn world_at(&self, number: u64) -> Option<WorldState> {
+        self.state_history.get(number as usize).cloned()
     }
 
     /// The nonce the sender's *next* transaction must carry: the mined nonce plus
@@ -932,8 +939,10 @@ mod tests {
     #[test]
     fn recent_block_hashes_include_genesis_on_a_fresh_chain() {
         let state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
-        let hashes = state.recent_block_hashes();
+        let hashes = state.recent_block_hashes(0);
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[&0], state.head().hash);
+        // Asking past the head never invents blocks.
+        assert_eq!(state.recent_block_hashes(10), hashes);
     }
 }

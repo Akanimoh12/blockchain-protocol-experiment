@@ -15,7 +15,10 @@ use primitives::{
     node::{BlockState, BreejaGenesis},
 };
 
-use crate::pool;
+use crate::{
+    evm::{BlockContext, BreejaDb},
+    pool,
+};
 
 /// The knobs that define how this node mines.
 #[derive(Debug, Clone)]
@@ -97,6 +100,29 @@ impl Chain {
         self.mempool_generation.fetch_add(1, Ordering::Release);
         tracing::info!(tx = %hash, "accepted transaction into the mempool");
         Ok(hash)
+    }
+
+    /// What `eth_call` and `eth_estimateGas` execute against: a private copy of
+    /// the state after block `number`, and the context of a block built on top
+    /// of it. `None` if that block does not exist.
+    ///
+    /// The lock is held only to copy the state. A simulation — and a gas
+    /// estimate is about twenty of them — then runs without blocking the miner
+    /// or anyone submitting a transaction.
+    pub fn simulation_env(&self, number: u64) -> Option<(BreejaDb, BlockContext)> {
+        let state = self.read();
+        let parent = state.get_block(number)?;
+        let db = BreejaDb::new(state.world_at(number)?, state.recent_block_hashes(number));
+        let block = BlockContext {
+            number: parent.number + 1,
+            // The next block's real timestamp is unknown until it is mined; one
+            // second after its parent is the earliest it could be.
+            timestamp: parent.timestamp + 1,
+            miner: self.config.miner,
+            difficulty: parent.difficulty,
+            parent_hash: parent.hash,
+        };
+        Some((db, block))
     }
 
     /// A counter that changes whenever the mempool gains a transaction.

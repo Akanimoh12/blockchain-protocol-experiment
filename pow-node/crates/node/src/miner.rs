@@ -55,7 +55,7 @@ fn run(chain: Chain) {
             let state = chain.read();
             (
                 state.world_snapshot(),
-                state.recent_block_hashes(),
+                state.recent_block_hashes(state.get_block_number()),
                 state.head().clone(),
                 state.peek_mempool_batch(),
             )
