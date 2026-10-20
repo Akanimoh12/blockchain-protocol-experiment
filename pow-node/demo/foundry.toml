@@ -1,0 +1,9 @@
+[profile.default]
+src = "."
+out = "out"
+cache_path = "cache"
+libs = []
+solc = "0.8.30"
+# Breeja executes with Shanghai rules. Newer EVM versions make solc emit
+# Cancun opcodes such as MCOPY and TSTORE, which this node would reject.
+evm_version = "shanghai"

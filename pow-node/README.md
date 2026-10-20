@@ -132,6 +132,27 @@ curl -s -X POST http://localhost:8545 -H 'Content-Type: application/json' \
 A `null` receipt means "not mined yet" — which is exactly how every Ethereum
 client waits for confirmation.
 
+## Deploying a Solidity contract: the demo
+
+```bash
+./demo/demo.sh
+```
+
+[demo/demo.sh](demo/demo.sh) deploys [demo/Counter.sol](demo/Counter.sol) with
+`forge create`, then works through it with `cast`: read with `eth_call`, estimate
+and send `increment()`, read the storage slot, find the event with `eth_getLogs`
+(including by its indexed topic), show that `eth_call` keeps nothing, and finally
+mine a transaction that reverts — status `0x0`, gas still paid, nonce still used.
+Every step checks its result, and the script exits non-zero on the first surprise.
+
+It uses the node at `$ETH_RPC_URL` (default `127.0.0.1:8545`), or builds and
+starts a `--dev` node itself if none is running, and stops it afterwards. It
+needs [Foundry](https://getfoundry.sh) and `jq`.
+
+[demo/foundry.toml](demo/foundry.toml) pins `evm_version = "shanghai"`. That is
+not optional: newer EVM versions make `solc` emit Cancun opcodes such as `MCOPY`,
+which a Shanghai node rejects.
+
 ## The JSON-RPC API
 
 The eleven methods from the assignment, plus the four a node with an EVM needs.
