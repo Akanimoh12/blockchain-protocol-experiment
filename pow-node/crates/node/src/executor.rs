@@ -4,7 +4,8 @@ use alloy::primitives::{Address, B256};
 use primitives::{
     constants::BLOCK_REWARD,
     node::{
-        Account, PendingTransaction, Transaction, TransactionReceipt, WorldState, hash_list_root,
+        Account, Log, PendingTransaction, Transaction, TransactionReceipt, WorldState,
+        hash_list_root,
     },
 };
 
@@ -41,10 +42,18 @@ pub fn pay_block_reward(
 /// Executes a batch of pending transactions through the EVM, producing the state
 /// and receipts the next block will commit to.
 ///
-/// A transaction REVM refuses to execute is *skipped*, not included: a wrong
-/// nonce or a sender who can no longer afford the gas means it was never valid
-/// to mine. Breeja validates everything before it reaches the mempool, so the
-/// only refusals left are races — a nonce that another transaction already used.
+/// There are two very different ways for a transaction to fail here.
+///
+/// A transaction that *runs and then fails* — it reverts, or runs out of gas —
+/// is included anyway, with `status: 0`. The sender still pays for the gas it
+/// burned and its nonce still advances, because the miner still did the work of
+/// executing it. Without that, anyone could make every miner run expensive code
+/// for free.
+///
+/// A transaction REVM refuses to execute *at all* is skipped: a wrong nonce or a
+/// sender who can no longer afford the gas means it was never valid to mine.
+/// Breeja validates everything before it reaches the mempool, so the only
+/// refusals left are races — a nonce that another transaction already used.
 pub fn execute_block(
     world: WorldState,
     block_hashes: HashMap<u64, B256>,
@@ -55,6 +64,7 @@ pub fn execute_block(
     let mut transactions = Vec::new();
     let mut receipts = Vec::new();
     let mut gas_used = 0u64;
+    let mut log_count = 0u64;
 
     for tx in batch {
         let outcome = match execute_transaction(&mut db, block, tx) {
@@ -82,11 +92,31 @@ pub fn execute_block(
             nonce: tx.nonce,
             gas: tx.gas,
             gas_price: tx.gas_price,
-            input: Default::default(),
+            input: tx.input.clone(),
             v: tx.v,
             r: tx.r,
             s: tx.s,
         });
+
+        let logs = outcome
+            .logs
+            .into_iter()
+            .map(|log| {
+                let log = Log {
+                    address: log.address,
+                    topics: log.data.topics().to_vec(),
+                    data: log.data.data,
+                    // Stamped in once the block is sealed, like the receipt's.
+                    block_hash: B256::ZERO,
+                    block_number: block.number,
+                    transaction_hash: tx.hash,
+                    transaction_index: index,
+                    log_index: log_count,
+                };
+                log_count += 1;
+                log
+            })
+            .collect();
 
         receipts.push(TransactionReceipt {
             transaction_hash: tx.hash,
@@ -98,6 +128,8 @@ pub fn execute_block(
             gas_used: outcome.gas_used,
             cummulative_gas_used: gas_used,
             effective_gas_price: tx.gas_price,
+            contract_address: outcome.created_address,
+            logs,
             status: outcome.success as u8,
         });
     }
@@ -160,11 +192,12 @@ mod tests {
         PendingTransaction {
             hash: B256::repeat_byte(0xab),
             from: DEV_ADDRESS,
-            to: DEV_ADDRESS_1,
+            to: Some(DEV_ADDRESS_1),
             value,
             nonce,
             gas: TRANSFER_GAS,
             gas_price: GAS_PRICE,
+            input: Default::default(),
             chain_id: CHAIN_ID,
             v: 0,
             r: U256::ZERO,

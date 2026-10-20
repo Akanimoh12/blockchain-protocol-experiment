@@ -96,9 +96,6 @@ pub struct BlockHeader {
 }
 
 /// A transaction that has been included in a block.
-///
-/// `input` is always empty: Breeja rejects anything with calldata, because it
-/// has no EVM to run it with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -108,7 +105,9 @@ pub struct Transaction {
     pub transaction_index: u64,
     pub chain_id: u64,
     pub from: Address,
-    pub to: Address,
+    /// `None` for a contract deployment, which has no recipient yet — the
+    /// address it creates is in the receipt.
+    pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
@@ -128,13 +127,40 @@ pub struct TransactionReceipt {
     pub block_hash: B256,
     pub block_number: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub gas_used: u64,
     pub cummulative_gas_used: u64,
     pub effective_gas_price: u128,
-    /// `1` for success. Breeja only ever includes transactions it has already
-    /// validated, so a receipt is never a failure.
+    /// The address a deployment created; `None` for everything else, including
+    /// a deployment that reverted.
+    pub contract_address: Option<Address>,
+    pub logs: Vec<Log>,
+    /// `1` if execution succeeded, `0` if it reverted or halted.
+    ///
+    /// A failed transaction is still mined and still pays for the gas it burned:
+    /// the miner did the work of running it either way. This field is the only
+    /// way to tell the two apart once the transaction is in a block.
     pub status: u8,
+}
+
+/// An event emitted by a contract's `LOG0`–`LOG4` opcodes.
+///
+/// The address, topics and data are what the contract emitted. The rest locates
+/// the log on chain, which `eth_getLogs` and receipts both report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Log {
+    /// The contract that emitted it.
+    pub address: Address,
+    /// Up to four indexed values; the first is usually the event signature hash.
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    pub block_hash: B256,
+    pub block_number: u64,
+    pub transaction_hash: B256,
+    pub transaction_index: u64,
+    /// Position among *all* logs in the block, not just this transaction's.
+    pub log_index: u64,
 }
 
 /// A transaction that has been accepted into the mempool but not yet mined.
@@ -142,15 +168,38 @@ pub struct TransactionReceipt {
 pub struct PendingTransaction {
     pub hash: B256,
     pub from: Address,
-    pub to: Address,
+    /// `None` deploys a contract.
+    pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
     pub gas_price: u128,
+    /// Calldata for a call, or initcode for a deployment.
+    pub input: Bytes,
     pub chain_id: u64,
     pub v: u64,
     pub r: U256,
     pub s: U256,
+}
+
+/// The gas a transaction costs before any of its code runs, under Shanghai
+/// rules.
+///
+/// Every transaction pays 21,000. Calldata is charged per byte — 4 for a zero
+/// byte, 16 for anything else (EIP-2028) — because every node has to store and
+/// relay it. A deployment pays 32,000 more to create an account, plus 2 per
+/// 32-byte word of initcode (EIP-3860) for the analysis it forces.
+///
+/// A transaction whose gas limit is below this can never execute, so the
+/// mempool rejects it outright.
+pub fn intrinsic_gas(input: &[u8], is_create: bool) -> u64 {
+    let zeros = input.iter().filter(|byte| **byte == 0).count() as u64;
+    let non_zeros = input.len() as u64 - zeros;
+    let mut gas = TRANSFER_GAS + zeros * 4 + non_zeros * 16;
+    if is_create {
+        gas += 32_000 + 2 * (input.len() as u64).div_ceil(32);
+    }
+    gas
 }
 
 /// The accounts a chain starts with, before any block has been mined.
@@ -777,11 +826,13 @@ mod tests {
         state.add_to_mempool(PendingTransaction {
             hash: B256::repeat_byte(0xaa),
             from: sender,
-            to: Address::repeat_byte(0x22),
+            // `to` became optional and `input` was added when contracts did.
+            to: Some(Address::repeat_byte(0x22)),
             value: one_eth,
             nonce: 0,
             gas: TRANSFER_GAS,
             gas_price: GAS_PRICE,
+            input: Bytes::new(),
             chain_id: 1,
             v: 0,
             r: U256::ZERO,
@@ -865,6 +916,17 @@ mod tests {
         world.remove_account(&a);
         assert_eq!(world.account(&a), Account::default());
         assert_eq!(world.storage_at(&a, U256::from(1)), U256::ZERO);
+    }
+
+    #[test]
+    fn intrinsic_gas_charges_for_calldata_and_creation() {
+        // A plain transfer: exactly the old constant.
+        assert_eq!(intrinsic_gas(&[], false), 21_000);
+        // Zero bytes are cheap, non-zero bytes are not.
+        assert_eq!(intrinsic_gas(&[0, 0], false), 21_000 + 8);
+        assert_eq!(intrinsic_gas(&[1, 2], false), 21_000 + 32);
+        // A deployment: +32,000, plus 2 gas per started 32-byte word of initcode.
+        assert_eq!(intrinsic_gas(&[1; 33], true), 21_000 + 33 * 16 + 32_000 + 2 * 2);
     }
 
     #[test]

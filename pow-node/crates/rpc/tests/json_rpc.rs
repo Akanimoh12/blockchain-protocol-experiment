@@ -369,7 +369,7 @@ async fn a_transfer_produces_a_transaction_and_a_receipt() {
     assert_eq!(receipt["to"], format!("{bob:#x}"));
     assert!(
         receipt["contractAddress"].is_null(),
-        "no contracts without an EVM"
+        "a transfer deploys nothing"
     );
     assert_eq!(receipt["logs"].as_array().unwrap().len(), 0);
     assert_eq!(receipt["blockHash"], tx["blockHash"]);

@@ -53,10 +53,16 @@ pub struct BlockContext {
 /// What executing one transaction produced.
 #[derive(Debug, Clone)]
 pub struct TxOutcome {
-    /// `true` if execution completed; `false` if it reverted or halted.
+    /// `true` if execution completed; `false` if it reverted or halted. Either
+    /// way the transaction was valid, is mined, and paid for its gas.
     pub success: bool,
     /// Gas actually charged, after refunds.
     pub gas_used: u64,
+    /// The new contract's address, for a deployment that succeeded.
+    pub created_address: Option<Address>,
+    /// Events the code emitted. Always empty for a failed transaction: a revert
+    /// undoes its logs along with everything else.
+    pub logs: Vec<revm::primitives::Log>,
 }
 
 impl BlockContext {
@@ -93,8 +99,9 @@ fn tx_env(tx: &PendingTransaction) -> TxEnv {
         caller: tx.from,
         gas_limit: tx.gas,
         gas_price: tx.gas_price,
-        kind: TxKind::Call(tx.to),
+        kind: tx.to.map_or(TxKind::Create, TxKind::Call),
         value: tx.value,
+        data: tx.input.clone(),
         nonce: tx.nonce,
         chain_id: Some(tx.chain_id),
         ..Default::default()
@@ -122,6 +129,8 @@ pub fn execute_transaction(
     let summary = TxOutcome {
         success: outcome.result.is_success(),
         gas_used: outcome.result.tx_gas_used(),
+        created_address: outcome.result.created_address(),
+        logs: outcome.result.logs().to_vec(),
     };
 
     // The EVM holds `db` mutably for as long as it lives, so it has to go
